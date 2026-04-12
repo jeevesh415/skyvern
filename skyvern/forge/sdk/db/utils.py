@@ -36,6 +36,8 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
+    BitwardenCredential,
+    BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
 )
@@ -69,6 +71,7 @@ from skyvern.webeye.actions.actions import (
     ActionType,
     CheckboxAction,
     ClickAction,
+    ClosePageAction,
     CompleteAction,
     DownloadFileAction,
     DragAction,
@@ -146,6 +149,33 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
         return None
 
 
+def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
+    """
+    Serialize proxy_location for database storage.
+
+    Converts GeoTarget objects or dicts to JSON strings, passes through
+    ProxyLocation enum values as-is, and returns None for None.
+    """
+    result: str | None = None
+    if proxy_location is None:
+        result = None
+    elif isinstance(proxy_location, GeoTarget):
+        result = json.dumps(proxy_location.model_dump())
+    elif isinstance(proxy_location, dict):
+        result = json.dumps(proxy_location)
+    else:
+        # ProxyLocation enum - return the string value
+        result = str(proxy_location)
+
+    LOG.debug(
+        "Serializing proxy_location for DB",
+        input_type=type(proxy_location).__name__,
+        input_value=str(proxy_location),
+        serialized_value=result,
+    )
+    return result
+
+
 # Mapping of action types to their corresponding action classes
 ACTION_TYPE_TO_CLASS = {
     ActionType.CLICK: ClickAction,
@@ -161,6 +191,7 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.HOVER: HoverAction,
     ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
     ActionType.RELOAD_PAGE: ReloadPageAction,
+    ActionType.CLOSE_PAGE: ClosePageAction,
     ActionType.EXTRACT: ExtractAction,
     ActionType.SCROLL: ScrollAction,
     ActionType.KEYPRESS: KeypressAction,
@@ -223,6 +254,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
+        failure_category=task_obj.failure_category,
     )
     return task
 
@@ -287,7 +319,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel, token_type: str
-) -> OrganizationAuthToken | AzureOrganizationAuthToken:
+) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
@@ -295,6 +327,17 @@ async def convert_to_organization_auth_token(
     if token_type == OrganizationAuthTokenType.azure_client_secret_credential:
         credential = AzureClientSecretCredential.model_validate_json(token)
         return AzureOrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            credential=credential,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
+    elif token_type == OrganizationAuthTokenType.bitwarden_credential:
+        credential = BitwardenCredential.model_validate_json(token)
+        return BitwardenOrganizationAuthToken(
             id=org_auth_token.id,
             organization_id=org_auth_token.organization_id,
             token_type=OrganizationAuthTokenType(org_auth_token.token_type),
@@ -326,6 +369,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         artifact_id=artifact_model.artifact_id,
         artifact_type=ArtifactType[artifact_model.artifact_type.upper()],
         uri=artifact_model.uri,
+        bundle_key=artifact_model.bundle_key,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,
@@ -387,6 +431,7 @@ def convert_to_workflow(
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
         adaptive_caching=workflow_model.adaptive_caching,
+        code_version=workflow_model.code_version,
         generate_script_on_terminal=workflow_model.generate_script_on_terminal,
         run_sequentially=workflow_model.run_sequentially,
         sequential_key=workflow_model.sequential_key,
@@ -440,6 +485,7 @@ def convert_to_workflow_run(
         ai_fallback=workflow_run_model.ai_fallback,
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
+        failure_category=workflow_run_model.failure_category,
     )
 
 

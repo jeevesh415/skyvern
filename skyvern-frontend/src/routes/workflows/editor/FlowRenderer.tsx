@@ -1,3 +1,4 @@
+import { usePostHog } from "posthog-js/react";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { Button } from "@/components/ui/button";
 import {
@@ -321,6 +322,7 @@ function FlowRenderer({
 }: Props) {
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
+  const postHog = usePostHog();
   const debugStore = useDebugStore();
   const { title, initializeTitle } = useWorkflowTitleStore();
   // const [parameters] = useState<ParametersState>(initialParameters);
@@ -462,6 +464,29 @@ function FlowRenderer({
       window.removeEventListener(
         "loop-header-resized",
         handleLoopHeaderResized,
+      );
+    };
+  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+
+  // Re-layout when a conditional node's header height changes (e.g., expression textarea resized)
+  useEffect(() => {
+    const handleConditionalHeaderResized = () => {
+      // Delay to let React process the updateNodeData state change
+      setTimeout(() => {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const currentEdges = reactFlowInstance.getEdges();
+        debouncedLayoutForDimensions(currentNodes, currentEdges);
+      }, 10);
+    };
+
+    window.addEventListener(
+      "conditional-header-resized",
+      handleConditionalHeaderResized,
+    );
+    return () => {
+      window.removeEventListener(
+        "conditional-header-resized",
+        handleConditionalHeaderResized,
       );
     };
   }, [reactFlowInstance, debouncedLayoutForDimensions]);
@@ -636,10 +661,21 @@ function FlowRenderer({
       );
 
       workflowChangesStore.setHasChanges(true);
+      postHog.capture("builder.block.removed", {
+        org_id: workflow.organization_id,
+        block_type: node.type,
+      });
 
       doLayout(newNodesWithUpdatedParameters, newEdges);
     },
-    [nodes, edges, doLayout, workflowChangesStore],
+    [
+      nodes,
+      edges,
+      doLayout,
+      workflowChangesStore,
+      postHog,
+      workflow.organization_id,
+    ],
   );
 
   // Use a ref to always have access to the latest deleteNode without causing re-renders

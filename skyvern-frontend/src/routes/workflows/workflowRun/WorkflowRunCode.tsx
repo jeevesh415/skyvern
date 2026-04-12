@@ -77,9 +77,6 @@ function WorkflowRunCode(props?: Props) {
     workflowRunId: workflowRun?.workflow_run_id,
   });
 
-  const isAdaptiveCaching =
-    workflow?.adaptive_caching && workflow?.run_with === "code";
-
   useEffect(() => {
     const keys = Object.keys(blockScriptsPublished?.blocks ?? {});
     setHasPublishedCode(
@@ -127,15 +124,15 @@ function WorkflowRunCode(props?: Props) {
     ? selectedVersionCode
     : activeScripts;
 
-  // For non-adaptive-caching, use block labels from the displayed version
+  // Use block labels from the displayed version when viewing an older version
   // (older versions may have different blocks than the current run)
   const displayBlockLabels = isViewingOtherVersion
     ? Object.keys(displayScripts?.blocks ?? {})
     : orderedBlockLabels;
 
-  // For adaptive caching, prefer the full main.py script over stitched blocks
+  // Prefer the full main_script when available, fall back to stitched blocks
   const code = (
-    isAdaptiveCaching && displayScripts?.main_script
+    displayScripts?.main_script
       ? displayScripts.main_script
       : getCode(displayBlockLabels, displayScripts?.blocks).join("")
   ).trim();
@@ -287,21 +284,21 @@ function WorkflowRunCode(props?: Props) {
   const generatedByThisRun = versions.filter(
     (v) => v.run_id != null && v.run_id === workflowRunId,
   );
-  const generatedVersion =
-    generatedByThisRun.length > 0
-      ? Math.max(...generatedByThisRun.map((v) => v.version))
-      : currentVersion;
-  const earliestGeneratedVersion =
-    generatedByThisRun.length > 0
-      ? Math.min(...generatedByThisRun.map((v) => v.version))
-      : null;
-  const usedVersion =
-    earliestGeneratedVersion != null
-      ? versions.find(
-          (v) =>
-            v.version < earliestGeneratedVersion && v.run_id !== workflowRunId,
-        )?.version ?? null
-      : null;
+  const didGenerate = generatedByThisRun.length > 0;
+  const generatedVersion = didGenerate
+    ? Math.max(...generatedByThisRun.map((v) => v.version))
+    : null;
+  const earliestGeneratedVersion = didGenerate
+    ? Math.min(...generatedByThisRun.map((v) => v.version))
+    : null;
+  // "Used" = the version that existed before this run created new ones,
+  // OR the currentVersion if the run didn't generate anything (just used cache)
+  const usedVersion = didGenerate
+    ? (versions.find(
+        (v) =>
+          v.version < earliestGeneratedVersion! && v.run_id !== workflowRunId,
+      )?.version ?? null)
+    : currentVersion;
 
   // Edit button shown when not in edit mode and there's a script to edit
   const editButton =
@@ -342,7 +339,7 @@ function WorkflowRunCode(props?: Props) {
     ) : null;
 
   // Version selector — "Used → Generated" chips instead of dropdown
-  const activeChipVersion = selectedVersion ?? generatedVersion;
+  const activeChipVersion = selectedVersion ?? generatedVersion ?? usedVersion;
 
   const versionSelector = !versionsFetched ? null : (
     <div className="flex items-center gap-1">
@@ -356,12 +353,12 @@ function WorkflowRunCode(props?: Props) {
                 ? "border-blue-500 bg-blue-500/20 text-blue-300"
                 : "border-slate-700 text-slate-400 hover:border-slate-500",
             )}
-            onClick={() => setSelectedVersion(usedVersion)}
+            onClick={() => setSelectedVersion(didGenerate ? usedVersion : null)}
             disabled={isEditing}
           >
             Used: #{usedVersion}
           </button>
-          <span className="text-xs text-slate-600">→</span>
+          {didGenerate && <span className="text-xs text-slate-600">→</span>}
         </>
       )}
       {generatedVersion != null && (

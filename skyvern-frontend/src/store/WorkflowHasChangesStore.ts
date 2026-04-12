@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { create } from "zustand";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
@@ -84,6 +85,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
 const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const postHog = usePostHog();
   const {
     getSaveData,
     saidOkToCodeCacheDeletion,
@@ -150,13 +152,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
-        run_with:
-          saveData.settings.runWith === "code_v2"
-            ? "code"
-            : saveData.settings.runWith,
+        run_with: saveData.settings.runWith,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
-        adaptive_caching: saveData.settings.runWith === "code_v2",
+        code_version:
+          saveData.settings.runWith === "code"
+            ? (saveData.settings.codeVersion ?? 2)
+            : undefined,
         workflow_definition: {
           version: saveData.workflowDefinitionVersion,
           parameters: saveData.parameters,
@@ -192,6 +194,13 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       if (!saveData) {
         return;
       }
+
+      postHog.capture("builder.workflow.saved", {
+        org_id: saveData.workflow.organization_id,
+        workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+        block_count: saveData.blocks.length,
+        block_types: saveData.blocks.map((b) => b.block_type),
+      });
 
       toast({
         title: "Changes saved",
@@ -246,7 +255,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             const loc = err.loc
               ?.filter((part) => part !== "body" && part !== "__root__")
               .join(" -> ");
-            return loc ? `${loc}: ${err.msg}` : err.msg ?? "Unknown error";
+            return loc ? `${loc}: ${err.msg}` : (err.msg ?? "Unknown error");
           })
           .join("; ");
       } else {

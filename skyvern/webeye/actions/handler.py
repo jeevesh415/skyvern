@@ -67,9 +67,11 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
@@ -408,7 +410,7 @@ class ActionHandler:
                 page=page,
                 action=action,
             )
-            persisted_action = await app.DATABASE.create_action(action=action)
+            persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
             return results
 
@@ -419,6 +421,7 @@ class ActionHandler:
             )
         )
         initial_page_count = 0
+        page_url_before_download = page.url
         # get the initial page count
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
@@ -524,7 +527,26 @@ class ActionHandler:
                     # close the extra page
                     await pages_after_download[-1].close()
 
-            persisted_action = await app.DATABASE.create_action(action=action)
+                # After a print/download action the working page sometimes navigates to
+                # about:blank (e.g. when the browser follows a download URL that yields no
+                # renderable content). Detect this and navigate back to the original URL so
+                # subsequent steps are not stuck on a blank page.
+                blank_page_urls = {"about:blank", ":"}
+                if page.url in blank_page_urls and page_url_before_download not in blank_page_urls:
+                    LOG.warning(
+                        "Working page navigated to blank after download action, navigating back to original URL",
+                        original_url=page_url_before_download,
+                    )
+                    try:
+                        await browser_state.navigate_to_url(page=page, url=page_url_before_download)
+                    except Exception:
+                        LOG.warning(
+                            "Failed to navigate back to original URL after blank page from download",
+                            original_url=page_url_before_download,
+                            exc_info=True,
+                        )
+
+            persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
 
     @staticmethod
@@ -730,6 +752,7 @@ async def handle_click_action(
                 if await skyvern_element.navigate_to_a_href(page=page):
                     return [ActionSuccess()]
 
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
         if action.repeat == 1:
             await page.mouse.click(x=action.x, y=action.y, button=action.button)
         elif action.repeat == 2:
@@ -755,19 +778,18 @@ async def handle_click_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
-    # Skip scroll_into_view when a page-level SCROLL just completed on THIS element.
-    # The scroll positioned the page at the bottom to enable T&C buttons;
-    # scroll_into_view() would use programmatic window.scroll() to center the
-    # element, moving the page away from the bottom and re-disabling the button.
+    # Skip scroll_into_view when a SCROLL action just completed on THIS element.
+    # The scroll may have positioned the page or a container at the bottom to enable
+    # T&C buttons; element.scrollIntoView() would undo that positioning.
     # Uses element ID matching (not a boolean) so unrelated clicks aren't affected.
     skip_scroll_into_view = await page.evaluate(
-        "(id) => { const v = window.__skyvernPageScrolledElementId;"
-        " window.__skyvernPageScrolledElementId = null; return v === id; }",
+        "(id) => { const v = window.__skyvernScrolledElementId;"
+        " window.__skyvernScrolledElementId = null; return v === id; }",
         action.element_id,
     )
     if skip_scroll_into_view:
         LOG.info(
-            "Skipping scroll_into_view after page-level scroll to preserve scroll position",
+            "Skipping scroll_into_view after deliberate scroll action to preserve scroll position",
             element_id=skyvern_element.get_id(),
         )
     else:
@@ -1124,7 +1146,7 @@ async def handle_input_text_action(
 ) -> list[ActionResult]:
     if not action.element_id:
         # This is a CUA type action
-        await page.keyboard.type(action.text)
+        await EventStrategyFactory.type_text(page, None, action.text)
         return [ActionSuccess()]
 
     dom = DomUtil(scraped_page, page)
@@ -1609,7 +1631,7 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await handler_utils.download_file(file_url, action.model_dump())
+    file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
     is_file_input = await skyvern_element.is_file_input()
 
     if not is_file_input:
@@ -1997,6 +2019,7 @@ async def handle_select_option_action(
         await skyvern_element.scroll_into_view()
 
         try:
+            await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
             await skyvern_element.get_locator().click(timeout=timeout)
         except Exception:
             LOG.info(
@@ -2106,6 +2129,7 @@ async def handle_hover_action(
     try:
         await skyvern_element.hover_to_reveal()
         await skyvern_element.get_locator().scroll_into_view_if_needed()
+        await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
         await skyvern_element.get_locator().hover(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
 
         if action.hold_seconds and action.hold_seconds > 0:
@@ -2274,7 +2298,7 @@ async def handle_scroll_action(
             viewport = page.viewport_size
             center_x = viewport["width"] // 2 if viewport else 640
             center_y = viewport["height"] // 2 if viewport else 360
-            await page.mouse.move(center_x, center_y)
+            await EventStrategyFactory.move_cursor(page, center_x, center_y)
             wheel_delta = 500 if scroll_direction == "down" else -500
             # Dynamically compute iterations based on remaining scrollable distance
             # so we reach the bottom even on very long T&C pages.
@@ -2293,34 +2317,50 @@ async def handle_scroll_action(
                 iterations=iterations,
                 wheel_delta=wheel_delta,
             )
+            # Scroll per-iteration with page-reaction pauses between each chunk
+            # (e.g. lazy-load, infinite scroll, dynamically enabled buttons).
+            # Use raw page.mouse.wheel() here — the chunking + 100ms pauses already
+            # provide a natural pattern, and applying the custom event strategy
+            # per-iteration would add excessive latency per chunk.
             for _ in range(iterations):
                 await page.mouse.wheel(0, wheel_delta)
                 await page.wait_for_timeout(100)
             # Wait for page JS to process scroll events (e.g. enabling buttons)
             await page.wait_for_timeout(500)
 
-            # Record which element was just page-level scrolled. The click handler
+            # Record which element was just deliberately scrolled. The click handler
             # checks this to skip scroll_into_view() for the SAME element, which
-            # would use programmatic window.scroll() to center it — undoing the
+            # would use element.scrollIntoView() to center it — undoing the
             # scroll position that enables buttons on T&C pages. Using the element
             # ID (not a boolean) ensures unrelated clicks aren't affected.
             await page.evaluate(
-                "(id) => { window.__skyvernPageScrolledElementId = id; }",
+                "(id) => { window.__skyvernScrolledElementId = id; }",
                 action.element_id,
             )
             return [ActionSuccess(data={"page_level_scroll": True})]
-        elif not scroll_result:
+        elif scroll_result:
+            # Sub-container was scrolled successfully. Record the element ID so
+            # the click handler skips scroll_into_view() for this element — same
+            # protection as page-level scrolls. Without this, element.scrollIntoView()
+            # would re-center the container and undo the deliberate scroll (e.g.,
+            # scrolling a T&C modal to the bottom to enable an accept button).
+            await page.evaluate(
+                "(id) => { window.__skyvernScrolledElementId = id; }",
+                action.element_id,
+            )
+            return [ActionSuccess(data={"container_scroll": True})]
+        else:
             LOG.warning(
                 "Could not find scrollable container near element, falling back to mouse wheel",
                 element_id=action.element_id,
             )
-            await page.mouse.wheel(action.scroll_x, action.scroll_y)
+            await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     elif action.x and action.y:
         # Coordinate-based scrolling from CUA/UI-TARS agents
-        await page.mouse.move(action.x, action.y)
-        await page.mouse.wheel(action.scroll_x, action.scroll_y)
+        await EventStrategyFactory.move_cursor(page, action.x, action.y)
+        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     else:
-        await page.mouse.wheel(action.scroll_x, action.scroll_y)
+        await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
@@ -2344,7 +2384,7 @@ async def handle_move_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.mouse.move(action.x, action.y)
+    await EventStrategyFactory.move_cursor(page, action.x, action.y)
     return [ActionSuccess()]
 
 
@@ -2491,7 +2531,7 @@ async def chain_click(
     file = pending_upload_files or []
     if not file and action.file_url:
         file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
-        file = await handler_utils.download_file(file_url, action.model_dump())
+        file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
 
     is_filechooser_trigger = False
 
@@ -2509,6 +2549,7 @@ async def chain_click(
     """
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
+            await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         return [ActionSuccess()]
@@ -2597,22 +2638,27 @@ async def chain_click(
             dom=DomUtil(scraped_page=scraped_page, page=page)
         )
         if blocking_element is None:
-            if not blocked:
+            if blocked:
                 LOG.info(
-                    "Chain click: exit since the element is not blocking by any element",
+                    "Chain click: element is blocked by a non-interactable element, try to click by the coordinates",
                     action=action,
                     element=str(skyvern_element),
                     locator=locator,
                 )
-                return action_results
+            else:
+                # Element is visible and elementFromPoint returns the target itself,
+                # but Playwright's click still failed (e.g. element transiently
+                # unstable due to React re-render or CSS animation).  Fall through
+                # to coordinate click which bypasses Playwright's actionability
+                # checks while still dispatching a real mouse event.
+                LOG.info(
+                    "Chain click: element is visible and not blocked, but Playwright click failed — trying coordinate click",
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
 
             try:
-                LOG.info(
-                    "Chain click: element is blocked by an non-interactable element, try to click by the coordinates",
-                    action=action,
-                    element=str(skyvern_element),
-                    locator=locator,
-                )
                 await skyvern_element.coordinate_click(page=page)
                 action_results.append(ActionSuccess())
                 return action_results
@@ -2622,7 +2668,7 @@ async def chain_click(
                 )
 
             LOG.info(
-                "Chain click: element is blocked by an non-interactable element, going to use javascript click instead of playwright click",
+                "Chain click: coordinate click failed, going to use javascript click instead of playwright click",
                 action=action,
                 element=str(skyvern_element),
                 locator=locator,
@@ -2850,7 +2896,17 @@ async def choose_auto_completion_dropdown(
         if await locator.count() == 0:
             raise MissingElement(element_id=element_id)
 
-        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        # Use SkyvernElement.click() so we get the full fallback chain
+        # (Playwright click → coordinate click → JavaScript click).  Plain
+        # locator.click() can fail when the item or one of its ancestors has
+        # pointer-events:none, which is common in React/Vue dropdown lists.
+        selected_element = SkyvernElement(
+            locator=locator,
+            frame=current_frame,
+            static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
+        )
+        await selected_element.scroll_into_view()
+        await selected_element.click(page=page)
         clear_input = False
         return result
 
@@ -3031,11 +3087,151 @@ async def input_or_auto_complete_input(
             current_value = new_current_value
 
     else:
+        if not input_or_select_context.is_search_bar:
+            LOG.info(
+                "Auto completion attempts exhausted, trying discover-all-options fallback",
+                element_id=skyvern_element.get_id(),
+                original_text=text,
+            )
+            fallback_result = await discover_and_select_from_full_dropdown(
+                context=input_or_select_context,
+                page=page,
+                dom=dom,
+                original_text=text,
+                skyvern_element=skyvern_element,
+                step=step,
+                task=task,
+            )
+            if fallback_result is not None:
+                return fallback_result
+
         LOG.warning(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             context=input_or_select_context,
         )
         return None
+
+
+@traced()
+async def discover_and_select_from_full_dropdown(
+    context: InputOrSelectContext,
+    page: Page,
+    dom: DomUtil,
+    original_text: str,
+    skyvern_element: SkyvernElement,
+    step: Step,
+    task: Task,
+    relevance_threshold: float = 0.6,
+) -> ActionResult | None:
+    """Fallback for auto-completion: clear input, press ArrowDown to reveal all options,
+    then ask LLM to pick the best semantic match from actual dropdown values."""
+    if not await skyvern_element.is_visible():
+        return None
+
+    current_frame = skyvern_element.get_frame()
+    skyvern_frame = await SkyvernFrame.create_instance(current_frame)
+    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+    await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+
+    try:
+        await skyvern_element.scroll_into_view()
+        await skyvern_element.input_clear()
+
+        try:
+            await skyvern_element.press_key("ArrowDown")
+        except TimeoutError:
+            LOG.info(
+                "Timeout pressing ArrowDown in discover fallback, continuing",
+                element_id=skyvern_element.get_id(),
+            )
+
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+
+        incremental_element = await incremental_scraped.get_incremental_element_tree(
+            clean_and_remove_element_tree_factory(
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            ),
+        )
+
+        if not incremental_element:
+            LOG.info(
+                "Discover fallback: no options appeared after ArrowDown",
+                element_id=skyvern_element.get_id(),
+            )
+            return None
+
+        cleaned_elements = remove_duplicated_HTML_element(incremental_element)
+        html = incremental_scraped.build_html_tree(cleaned_elements)
+        new_element_ids = [e.get("id", "") for e in cleaned_elements if e.get("id")]
+
+        field_information = context.field if not context.intention else context.intention
+        prompt = prompt_engine.load_prompt(
+            "auto-completion-choose-option",
+            is_search=context.is_search_bar,
+            field_information=field_information,
+            filled_value=original_text,
+            navigation_goal=task.navigation_goal,
+            navigation_payload_str=json.dumps(task.navigation_payload),
+            elements=html,
+            new_elements_ids=new_element_ids,
+            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        )
+
+        LOG.info(
+            "Discover fallback: asking LLM to pick from actual options",
+            element_id=skyvern_element.get_id(),
+            original_text=original_text,
+        )
+        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
+            prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
+        )
+
+        element_id = json_response.get("id", "")
+        relevance_float = json_response.get("relevance_float", 0)
+
+        if not element_id or relevance_float < relevance_threshold:
+            LOG.info(
+                "Discover fallback: no suitable option found",
+                element_id=element_id,
+                relevance_float=relevance_float,
+                threshold=relevance_threshold,
+            )
+            return None
+
+        LOG.info(
+            "Discover fallback: found suitable option",
+            element_id=element_id,
+            relevance_float=relevance_float,
+        )
+
+        locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+        if await locator.count() == 0:
+            LOG.warning(
+                "Discover fallback: selected element not found in DOM",
+                element_id=element_id,
+            )
+            return None
+
+        selected_element = SkyvernElement(
+            locator=locator,
+            frame=current_frame,
+            static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
+        )
+        await selected_element.scroll_into_view()
+        await selected_element.click(page=page)
+        return ActionSuccess()
+
+    except Exception:
+        LOG.warning(
+            "Discover fallback failed",
+            exc_info=True,
+            original_text=original_text,
+        )
+        return None
+    finally:
+        await incremental_scraped.stop_listen_dom_increment()
 
 
 @traced()
@@ -3497,6 +3693,7 @@ async def select_from_dropdown(
             "Find an alternative option with the same value. Try to select the option.",
             value=value,
         )
+        await EventStrategyFactory.move_to_element(page, locator)
         await locator.click(timeout=timeout)
         single_select_result.action_result = ActionSuccess()
         return single_select_result
@@ -3986,9 +4183,31 @@ async def extract_information_for_navigation_goal(
     Scrapes a webpage and returns the scraped response, including:
     1. JSON representation of what the user is seeing
     2. The scraped page
+
+    Extraction-result cache
+    --------------------------------
+    Many workflows re-extract the same page on every iteration of a loop
+    (e.g. navigate back to a documents list, extract, click one row, repeat).
+    When the page content, data-extraction goal, and output schema are
+    identical to a previous call within the same workflow run, reuse the
+    prior LLM result instead of paying for another extract-information call.
     """
     scraped_page_refreshed = await scraped_page.refresh()
     context = ensure_context()
+
+    # Compute llm key up-front so the cache key includes it.
+    llm_key_override = task.llm_key
+    if await service_utils.is_cua_task(task=task):
+        # CUA tasks should use the default data extraction llm key
+        llm_key_override = None
+
+    # Compute local_datetime once so both the cache key and the prompt use the
+    # same value (avoids stale hits when date-relative extraction goals cross midnight).
+    local_datetime_str = datetime.now(context.tz_info).isoformat()
+
+    # Render the prompt FIRST so the cache key hashes the exact string that
+    # will be sent to the LLM (captures economy-tree swaps and 2/3 truncation
+    # inside load_prompt_with_elements).
     extract_information_prompt = load_prompt_with_elements(
         element_tree_builder=scraped_page_refreshed,
         prompt_engine=prompt_engine,
@@ -4002,13 +4221,28 @@ async def extract_information_for_navigation_goal(
         current_url=scraped_page_refreshed.url,
         extracted_text=scraped_page_refreshed.extracted_text,
         error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
-        local_datetime=datetime.now(context.tz_info).isoformat(),
+        local_datetime=local_datetime_str,
     )
 
-    llm_key_override = task.llm_key
-    if await service_utils.is_cua_task(task=task):
-        # CUA tasks should use the default data extraction llm key
-        llm_key_override = None
+    # Best-effort cache lookup — any failure falls through to LLM.
+    cache_key: str | None = None
+    try:
+        cache_key = extraction_cache.compute_cache_key(
+            rendered_prompt=extract_information_prompt,
+            llm_key=llm_key_override,
+        )
+        cached = extraction_cache.get(task.workflow_run_id, cache_key)
+        if cached is not None:
+            LOG.info(
+                "extract_information cache hit — skipping LLM call",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                cache_key=cache_key,
+            )
+            return ScrapeResult(scraped_data=cached)
+    except Exception:
+        LOG.warning("extract_information cache lookup failed; falling through to LLM", exc_info=True)
+        cache_key = None
 
     # Use the appropriate LLM handler based on the feature flag
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
@@ -4028,6 +4262,14 @@ async def extract_information_for_navigation_goal(
             extraction_result=json_response,
             schema=task.extracted_information_schema,
         )
+
+    # Cache the post-validation result so cache hits return the same shape as
+    # a fresh LLM call (schema-validated with missing fields filled).
+    if cache_key is not None and json_response is not None:
+        try:
+            extraction_cache.store(task.workflow_run_id, cache_key, json_response)
+        except Exception:
+            LOG.warning("extract_information cache store failed; ignoring", exc_info=True)
 
     return ScrapeResult(
         scraped_data=json_response,

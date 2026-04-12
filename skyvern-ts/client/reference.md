@@ -1,5 +1,5 @@
 # Reference
-<details><summary><code>client.<a href="/src/Client.ts">updateWorkflowFolder</a>(workflowPermanentId, { ...params }) -> Skyvern.Workflow</code></summary>
+<details><summary><code>client.<a href="/src/Client.ts">runSdkAction</a>({ ...params }) -> Skyvern.RunSdkActionResponse</code></summary>
 <dl>
 <dd>
 
@@ -11,7 +11,7 @@
 <dl>
 <dd>
 
-Update a workflow's folder assignment for the latest version
+Execute a single SDK action with the specified parameters
 </dd>
 </dl>
 </dd>
@@ -26,7 +26,12 @@ Update a workflow's folder assignment for the latest version
 <dd>
 
 ```typescript
-await client.updateWorkflowFolder("wpid_123");
+await client.runSdkAction({
+    url: "url",
+    action: {
+        type: "ai_act"
+    }
+});
 
 ```
 </dd>
@@ -42,15 +47,7 @@ await client.updateWorkflowFolder("wpid_123");
 <dl>
 <dd>
 
-**workflowPermanentId:** `string` — Workflow permanent ID
-    
-</dd>
-</dl>
-
-<dl>
-<dd>
-
-**request:** `Skyvern.UpdateWorkflowFolderRequest` 
+**request:** `Skyvern.RunSdkActionRequest` 
     
 </dd>
 </dl>
@@ -71,6 +68,70 @@ await client.updateWorkflowFolder("wpid_123");
 </details>
 
 ## 
+## Artifacts
+<details><summary><code>client.artifacts.<a href="/src/api/resources/artifacts/client/Client.ts">getArtifactContent</a>(artifactId) -> unknown</code></summary>
+<dl>
+<dd>
+
+#### 📝 Description
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+Download the raw content of an artifact (supports bundled artifacts).
+</dd>
+</dl>
+</dd>
+</dl>
+
+#### 🔌 Usage
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+```typescript
+await client.artifacts.getArtifactContent("artifact_id");
+
+```
+</dd>
+</dl>
+</dd>
+</dl>
+
+#### ⚙️ Parameters
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+**artifactId:** `string` 
+    
+</dd>
+</dl>
+
+<dl>
+<dd>
+
+**requestOptions:** `Artifacts.RequestOptions` 
+    
+</dd>
+</dl>
+</dd>
+</dl>
+
+
+</dd>
+</dl>
+</details>
+
 ## Scripts
 <details><summary><code>client.scripts.<a href="/src/api/resources/scripts/client/Client.ts">runScript</a>(scriptId) -> unknown</code></summary>
 <dl>

@@ -7,7 +7,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from skyvern.cli.core.browser_launcher import LocalBrowserInfo
@@ -17,7 +17,21 @@ import typer
 from skyvern.cli.commands._output import console, output, output_error
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
 from skyvern.cli.core.artifacts import save_artifact
-from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot
+from skyvern.cli.core.browser_ops import (
+    do_act,
+    do_extract,
+    do_find,
+    do_frame_list,
+    do_frame_main,
+    do_frame_switch,
+    do_get_html,
+    do_get_styles,
+    do_get_value,
+    do_navigate,
+    do_screenshot,
+    do_state_load,
+    do_state_save,
+)
 from skyvern.cli.core.client import get_skyvern
 from skyvern.cli.core.guards import (
     CREDENTIAL_HINT,
@@ -34,10 +48,19 @@ from skyvern.cli.core.ngrok import check_ngrok_auth, detect_ngrok, offer_install
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
+from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
 
 browser_app = typer.Typer(help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(help="Manage browser sessions.", no_args_is_help=True)
+frame_app = typer.Typer(help="Manage iframe context.", no_args_is_help=True)
+state_app = typer.Typer(help="Save and load browser auth state.", no_args_is_help=True)
+storage_app = typer.Typer(help="Read, write, and clear web storage.", no_args_is_help=True)
+network_app = typer.Typer(help="Network inspection and interception.", no_args_is_help=True)
 browser_app.add_typer(session_app, name="session")
+browser_app.add_typer(frame_app, name="frame")
+browser_app.add_typer(state_app, name="state")
+browser_app.add_typer(storage_app, name="storage")
+browser_app.add_typer(network_app, name="network")
 
 
 @dataclass(frozen=True)
@@ -94,6 +117,31 @@ def _resolve_ai_target(selector: str | None, intent: str | None, *, operation: s
             ),
         )
     return ai_mode
+
+
+async def _apply_cli_frame_state(page: Any) -> None:
+    """Re-apply saved frame state from CLIState to a fresh SkyvernBrowserPage.
+
+    CLI commands get a new page object each invocation. If the user previously
+    ran ``skyvern browser frame switch``, the target frame is persisted in
+    CLIState and must be re-entered before executing the action.
+    """
+    state = load_state()
+    if not state:
+        return
+    selector = state.frame_selector
+    name = state.frame_name
+    index = state.frame_index
+    if selector is None and name is None and index is None:
+        return
+    try:
+        await do_frame_switch(page, selector=selector, name=name, index=index)
+    except Exception as e:
+        console.print(f"[yellow]Warning: saved frame state is stale, clearing ({e})[/yellow]")
+        state.frame_selector = None
+        state.frame_name = None
+        state.frame_index = None
+        save_state(state)
 
 
 def _validate_wait_state(state: str) -> None:
@@ -273,6 +321,133 @@ def session_get(
 
 
 # ---------------------------------------------------------------------------
+# Network commands
+# ---------------------------------------------------------------------------
+
+
+@network_app.command("requests")
+def network_requests_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    url_pattern: str | None = typer.Option(None, "--url", help="Filter by URL regex pattern."),
+    status_code: int | None = typer.Option(None, "--status", help="Filter by HTTP status code."),
+    method: str | None = typer.Option(None, "--method", help="Filter by HTTP method."),
+    resource_type: str | None = typer.Option(None, "--type", help="Filter by resource type (xhr, fetch, script, etc)."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List captured network requests."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_network_requests
+
+    state = load_state()
+
+    async def _run() -> dict:
+        return await skyvern_network_requests(
+            session_id=session or (state.session_id if state else None),
+            cdp_url=cdp or (state.cdp_url if state else None),
+            url_pattern=url_pattern,
+            status_code=status_code,
+            method=method,
+            resource_type=resource_type,
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="network_requests")
+    except Exception as e:
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+
+
+@network_app.command("detail")
+def network_detail_cmd(
+    request_id: int = typer.Argument(..., help="Request ID from network requests output."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Show full details (headers + body) for a specific network request."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_network_request_detail
+
+    state = load_state()
+
+    async def _run() -> dict:
+        return await skyvern_network_request_detail(
+            request_id=request_id,
+            session_id=session or (state.session_id if state else None),
+            cdp_url=cdp or (state.cdp_url if state else None),
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="network_detail")
+    except Exception as e:
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+
+
+@network_app.command("route")
+def network_route_cmd(
+    url_pattern: str = typer.Argument(..., help="URL glob pattern to intercept. Example: '**/api/*'"),
+    action: str = typer.Option("abort", help="Action: 'abort' or 'mock'."),
+    mock_status: int = typer.Option(200, "--mock-status", help="HTTP status for mock responses."),
+    mock_body: str | None = typer.Option(None, "--mock-body", help="Response body for mock action."),
+    mock_content_type: str | None = typer.Option(None, "--mock-content-type", help="Content-Type for mock responses."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Intercept network requests matching a URL pattern (abort or mock)."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_network_route
+
+    if action not in ("abort", "mock"):
+        output_error(f"Invalid action: {action!r}", hint="Use 'abort' or 'mock'.", json_mode=json_output)
+        return
+
+    state = load_state()
+
+    async def _run() -> dict:
+        return await skyvern_network_route(
+            url_pattern=url_pattern,
+            action=cast(Literal["abort", "mock"], action),
+            mock_status=mock_status,
+            mock_body=mock_body,
+            mock_content_type=mock_content_type,
+            session_id=session or (state.session_id if state else None),
+            cdp_url=cdp or (state.cdp_url if state else None),
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="network_route")
+    except Exception as e:
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+
+
+@network_app.command("unroute")
+def network_unroute_cmd(
+    url_pattern: str = typer.Argument(..., help="URL pattern to stop intercepting."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Remove a network interception rule."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_network_unroute
+
+    state = load_state()
+
+    async def _run() -> dict:
+        return await skyvern_network_unroute(
+            url_pattern=url_pattern,
+            session_id=session or (state.session_id if state else None),
+            cdp_url=cdp or (state.cdp_url if state else None),
+        )
+
+    try:
+        result = asyncio.run(_run())
+        _emit_tool_result(result, json_output=json_output, action="network_unroute")
+    except Exception as e:
+        output_error(str(e), hint="Ensure a browser session is active.", json_mode=json_output)
+
+
+# ---------------------------------------------------------------------------
 # Browser commands
 # ---------------------------------------------------------------------------
 
@@ -294,6 +469,12 @@ def navigate(
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
         result = await do_navigate(page, url, timeout=timeout, wait_until=wait_until)
+        cli_state = load_state()
+        if cli_state:
+            cli_state.frame_selector = None
+            cli_state.frame_name = None
+            cli_state.frame_index = None
+            save_state(cli_state)
         return {"url": result.url, "title": result.title}
 
     try:
@@ -322,6 +503,7 @@ def screenshot(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         result = await do_screenshot(page, full_page=full_page, selector=selector)
 
         if output_path:
@@ -365,6 +547,7 @@ def evaluate(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         result = await page.evaluate(expression)
         return {"result": result}
 
@@ -398,6 +581,7 @@ def click(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         kwargs: dict[str, Any] = {"timeout": timeout}
         if button:
@@ -443,6 +627,7 @@ def hover(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if ai_mode is not None:
             locator = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
@@ -489,6 +674,7 @@ def type_text(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if selector:
             try:
@@ -554,6 +740,7 @@ def scroll(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if intent:
             ai_mode = "fallback" if selector else "proactive"
@@ -601,6 +788,7 @@ def select(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if ai_mode is not None:
             await page.select_option(selector=selector, value=value, prompt=intent, ai=ai_mode, timeout=timeout)  # type: ignore[arg-type]
@@ -639,6 +827,7 @@ def press_key(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         if intent or selector:
             ai_mode, err = resolve_ai_mode(selector, intent)
@@ -694,6 +883,7 @@ def wait(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
 
         waited_for = ""
         if time_ms is not None:
@@ -751,6 +941,7 @@ def act(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         result = await do_act(page, prompt)
         return {"prompt": result.prompt, "completed": result.completed}
 
@@ -779,6 +970,7 @@ def extract(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         result = await do_extract(page, prompt, schema=schema)
         return {"prompt": prompt, "extracted": result.extracted}
 
@@ -806,6 +998,7 @@ def validate(
         connection = _resolve_connection(session, cdp)
         browser = await _connect_browser(connection)
         page = await browser.get_working_page()
+        await _apply_cli_frame_state(page)
         valid = await page.validate(prompt)
         return {"prompt": prompt, "valid": valid}
 
@@ -1378,3 +1571,492 @@ def _print_serve_instructions_unified(result: dict[str, Any], browser_path: str)
 
     console.print("[bold]Press Ctrl+C to stop.[/bold]")
     console.print()
+
+
+# ---------------------------------------------------------------------------
+# Frame commands (iframe switching)
+# ---------------------------------------------------------------------------
+
+
+@frame_app.command("switch")
+def frame_switch(
+    selector: str | None = typer.Option(None, "--selector", "-s", help="CSS selector for the iframe element."),
+    name: str | None = typer.Option(None, "--name", "-n", help="Frame name attribute."),
+    index: int | None = typer.Option(None, "--index", "-i", help="Frame index (0 = main)."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Switch into an iframe for subsequent commands."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        result = await do_frame_switch(page, selector=selector, name=name, index=index)
+        state = load_state()
+        if state:
+            state.frame_selector = selector
+            state.frame_name = name
+            state.frame_index = index
+            save_state(state)
+        return {"frame_name": result.name, "frame_url": result.url}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="frame_switch", json_mode=json_output)
+    except (ValueError, GuardError) as e:
+        output_error(str(e), hint="Use 'skyvern browser frame list' to find frames.", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@frame_app.command("main")
+def frame_main_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Switch back to the main page frame."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        do_frame_main(page)
+        state = load_state()
+        if state:
+            state.frame_selector = None
+            state.frame_name = None
+            state.frame_index = None
+            save_state(state)
+        return {"status": "switched_to_main_frame"}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="frame_main", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@frame_app.command("list")
+def frame_list_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List all frames on the current page."""
+
+    async def _run() -> list:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        frames = await do_frame_list(page)
+        return [{"index": f.index, "name": f.name, "url": f.url, "is_main": f.is_main} for f in frames]
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="frame_list", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── State persistence commands ──────────────────────────────────────
+
+
+@state_app.command("save")
+def state_save_cmd(
+    file_path: str = typer.Argument(help="Path to save state file (JSON)."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Save browser auth state (cookies + localStorage + sessionStorage) to a file."""
+    from skyvern.cli.mcp_tools.state import _validate_state_path
+
+    async def _run() -> dict:
+        resolved = _validate_state_path(file_path)
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        result = await do_state_save(page.page, browser, resolved)
+        return {
+            "file_path": result.file_path,
+            "cookie_count": result.cookie_count,
+            "local_storage_count": result.local_storage_count,
+            "session_storage_count": result.session_storage_count,
+            "url": result.url,
+        }
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="state_save", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@state_app.command("load")
+def state_load_cmd(
+    file_path: str = typer.Argument(help="Path to state file (JSON) from state save."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Load browser auth state (cookies + localStorage + sessionStorage) from a file."""
+    from urllib.parse import urlparse
+
+    from skyvern.cli.mcp_tools.state import _validate_state_path
+
+    async def _run() -> dict:
+        resolved = _validate_state_path(file_path, must_exist=True)
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        current_domain = urlparse(page.page.url).hostname or ""
+        result = await do_state_load(page.page, browser, resolved, current_domain)
+        return {
+            "cookie_count": result.cookie_count,
+            "local_storage_count": result.local_storage_count,
+            "session_storage_count": result.session_storage_count,
+            "source_url": result.source_url,
+            "skipped_cookies": result.skipped_cookies,
+        }
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="state_load", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── Web storage commands ────────────────────────────────────────────
+
+
+@storage_app.command("get-session")
+def storage_get_session_cmd(
+    keys: list[str] | None = typer.Argument(None, help="Specific keys to retrieve. Omit for all."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Read sessionStorage values from the current page."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        if keys:
+            items = {}
+            for key in keys:
+                val = await page.page.evaluate(f"() => window.sessionStorage.getItem({json.dumps(key)})")
+                if val is not None:
+                    items[key] = val
+        else:
+            items = await page.page.evaluate("() => Object.fromEntries(Object.entries(window.sessionStorage))")
+        return {"items": items, "count": len(items)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("set-session")
+def storage_set_session_cmd(
+    key: str = typer.Argument(help="The key to set."),
+    value: str = typer.Argument(help="The value to store."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Set a sessionStorage key-value pair."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        await page.page.evaluate("(args) => window.sessionStorage.setItem(args[0], args[1])", [key, value])
+        return {"key": key, "value_length": len(value)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="set_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("clear-session")
+def storage_clear_session_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Clear all sessionStorage entries."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        count = await page.page.evaluate(
+            "() => { const n = window.sessionStorage.length; window.sessionStorage.clear(); return n; }"
+        )
+        return {"cleared_count": count}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="clear_session_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@storage_app.command("clear-local")
+def storage_clear_local_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Clear all localStorage entries."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        count = await page.page.evaluate(
+            "() => { const n = window.localStorage.length; window.localStorage.clear(); return n; }"
+        )
+        return {"cleared_count": count}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="clear_local_storage", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── Page JS errors command ───────────────────────────────────────────
+
+
+@browser_app.command("get-errors")
+def get_errors_cmd(
+    text: str | None = typer.Option(None, "--text", help="Filter by substring match (case-insensitive)."),
+    clear: bool = typer.Option(False, "--clear", help="Clear the buffer after reading."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Read uncaught JavaScript errors from the browser page."""
+    from skyvern.cli.mcp_tools.inspection import skyvern_get_errors
+
+    async def _run() -> dict:
+        return await skyvern_get_errors(text=text, clear=clear, session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="get_errors", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── HAR recording commands ───────────────────────────────────────────
+
+
+@browser_app.command("har-start")
+def har_start_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Start recording network traffic in HAR format."""
+
+    async def _run() -> dict:
+        return await skyvern_har_start(session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="har_start", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@browser_app.command("har-stop")
+def har_stop_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Stop HAR recording and return captured traffic."""
+
+    async def _run() -> dict:
+        return await skyvern_har_stop(session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="har_stop", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ── DOM Inspection commands ──────────────────────────────────────────
+
+
+@browser_app.command("get-html")
+def get_html_cmd(
+    selector: str = typer.Argument(help="CSS or XPath selector for the element."),
+    outer: bool = typer.Option(False, "--outer", help="Return outerHTML instead of innerHTML."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Get the HTML content of a DOM element."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        html = await do_get_html(page.page, selector, outer=outer)
+        return {"html": html, "selector": selector, "outer": outer, "length": len(html)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_html", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@browser_app.command("get-value")
+def get_value_cmd(
+    selector: str = typer.Argument(help="CSS or XPath selector for the input element."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Get the current value of a form input element."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        value = await do_get_value(page.page, selector)
+        return {"value": value, "selector": selector}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_value", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@browser_app.command("get-styles")
+def get_styles_cmd(
+    selector: str = typer.Argument(help="CSS or XPath selector for the element."),
+    properties: list[str] | None = typer.Argument(None, help="Specific CSS properties (e.g. color font-size)."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Get computed CSS styles from a DOM element."""
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        styles = await do_get_styles(page.page, selector, properties=properties)
+        return {"styles": styles, "selector": selector, "count": len(styles)}
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="get_styles", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# -- Semantic locator command --
+
+
+@browser_app.command("find")
+def find_cmd(
+    by: str = typer.Argument(help="Locator type: role, text, label, placeholder, alt, testid."),
+    value: str = typer.Argument(help="The text/role/label to match."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Find elements using Playwright semantic locators (role, text, label, etc.)."""
+    from skyvern.cli.core.browser_ops import LOCATOR_TYPES
+
+    if by not in LOCATOR_TYPES:
+        output_error(
+            f"Invalid locator type: {by!r}. Must be one of: {', '.join(sorted(LOCATOR_TYPES))}", json_mode=json_output
+        )
+        raise typer.Exit(code=2)
+
+    async def _run() -> dict:
+        connection = _resolve_connection(session, cdp)
+        browser = await _connect_browser(connection)
+        page = await browser.get_working_page()
+        result = await do_find(page, by=by, value=value)
+        return asdict(result)
+
+    try:
+        data = asyncio.run(_run())
+        output(data, action="find", json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+# ---------------------------------------------------------------------------
+
+
+@browser_app.command("clipboard-read")
+def clipboard_read_cmd(
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Read text from the browser clipboard."""
+    from skyvern.cli.mcp_tools.browser import skyvern_clipboard_read
+
+    async def _run() -> dict:
+        return await skyvern_clipboard_read(session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="clipboard_read", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)
+
+
+@browser_app.command("clipboard-write")
+def clipboard_write_cmd(
+    text: str = typer.Argument(..., help="Text to write to the clipboard."),
+    session: str | None = typer.Option(None, help="Browser session ID."),
+    cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Write text to the browser clipboard."""
+    from skyvern.cli.mcp_tools.browser import skyvern_clipboard_write
+
+    async def _run() -> dict:
+        return await skyvern_clipboard_write(text=text, session_id=session, cdp_url=cdp)
+
+    try:
+        result = asyncio.run(_run())
+        if result.get("ok"):
+            output(result["data"], action="clipboard_write", json_mode=json_output)
+        else:
+            output_error(result.get("error", {}).get("message", "Unknown error"), json_mode=json_output)
+    except Exception as e:
+        output_error(str(e), json_mode=json_output)

@@ -17,10 +17,11 @@ import {
 import { getRuntimeApiKey } from "@/util/env";
 import { HiddenCopyableInput } from "@/components/ui/hidden-copyable-input";
 import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
+import { BitwardenCredentialForm } from "@/components/BitwardenCredentialForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
 import { useVersionQuery } from "@/hooks/useVersionQuery";
-import { formatVersion } from "@/util/version";
+import { formatVersion, getAppVersion } from "@/util/version";
 
 function Settings() {
   const { environment, organization, setEnvironment, setOrganization } =
@@ -94,6 +95,18 @@ function Settings() {
       </Card>
       <Card>
         <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Bitwarden Integration</CardTitle>
+          <CardDescription>
+            Configure your Bitwarden account credentials to use your own vault
+            for credential management.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-8">
+          <BitwardenCredentialForm />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
           <CardTitle className="text-lg">Azure Integration</CardTitle>
           <CardDescription>Manage your Azure integration</CardDescription>
         </CardHeader>
@@ -112,12 +125,12 @@ function Settings() {
           <CustomCredentialServiceConfigForm />
         </CardContent>
       </Card>
-      {(__APP_VERSION__ !== "development" || versionData?.version) && (
+      {(getAppVersion() !== "development" || versionData?.version) && (
         <p className="text-center text-xs text-muted-foreground/50">
-          {__APP_VERSION__ !== "development" && (
-            <>UI: {formatVersion(__APP_VERSION__)}</>
+          {getAppVersion() !== "development" && (
+            <>UI: {formatVersion(getAppVersion())}</>
           )}
-          {__APP_VERSION__ !== "development" && versionData?.version && " | "}
+          {getAppVersion() !== "development" && versionData?.version && " | "}
           {versionData?.version && (
             <>API: {formatVersion(versionData.version)}</>
           )}

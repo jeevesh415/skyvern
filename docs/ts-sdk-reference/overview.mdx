@@ -1,7 +1,19 @@
 ---
 title: TypeScript SDK
 subtitle: Install, authenticate, and configure the Skyvern TypeScript client
+description: Install the Skyvern TypeScript SDK, authenticate with your API key, and start running browser automation tasks and workflows programmatically.
 slug: ts-sdk-reference/overview
+keywords:
+  - install
+  - npm
+  - api key
+  - client
+  - configuration
+  - authentication
+  - environment
+  - timeout
+  - maxRetries
+  - abortSignal
 ---
 
 The `@skyvern/client` package wraps the Skyvern REST API in a typed TypeScript client with built-in browser automation via Playwright.
@@ -39,7 +51,7 @@ console.log(result.output);
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `apiKey` | `string` | — | **Required.** Your Skyvern API key. Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings/api-keys). |
+| `apiKey` | `string` | — | **Required.** Your Skyvern API key. Get one at [app.skyvern.com/settings](https://app.skyvern.com/settings/). |
 | `environment` | `SkyvernEnvironment \| string` | `Cloud` | Target environment. Options: `Cloud`, `Staging`, `Local`. |
 | `baseUrl` | `string` | `undefined` | Override the API base URL. Use this for self-hosted deployments. |
 | `timeoutInSeconds` | `number` | `60` | HTTP request timeout in seconds. |

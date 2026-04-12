@@ -21,6 +21,7 @@
   <a href="https://github.com/Skyvern-AI/skyvern/blob/main/LICENSE"><img src="https://img.shields.io/github/license/skyvern-ai/skyvern"/></a>
   <a href="https://twitter.com/skyvernai"><img src="https://img.shields.io/twitter/follow/skyvernai?style=social"/></a>
   <a href="https://www.linkedin.com/company/95726232"><img src="https://img.shields.io/badge/Follow%20 on%20LinkedIn-8A2BE2?logo=linkedin"/></a>
+  <a href="https://glama.ai/mcp/servers/Skyvern-AI/skyvern"><img src="https://glama.ai/mcp/servers/Skyvern-AI/skyvern/badge" alt="Skyvern MCP server" /></a>
 </p>
 
 [Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a Playwright-compatible SDK that adds AI functionality on top of playwright, as well as a no-code workflow builder to help both technical and non-technical users automate manual workflows on any website, replacing brittle or unreliable automation solutions.
@@ -433,9 +434,12 @@ Skyvern currently supports the following password manager integrations:
 
 
 ## Model Context Protocol (MCP)
+
+<a href="https://glama.ai/mcp/servers/Skyvern-AI/skyvern"><img src="https://glama.ai/mcp/servers/Skyvern-AI/skyvern/badge" alt="Skyvern MCP server" /></a>
+
 Skyvern supports the Model Context Protocol (MCP) to allow you to use any LLM that supports MCP.
 
-See the MCP documentation [here](https://github.com/Skyvern-AI/skyvern/blob/main/integrations/mcp/README.md)
+See the MCP documentation [here](https://github.com/Skyvern-AI/skyvern/blob/main/skyvern/cli/mcp_tools/README.md)
 
 ## Zapier / Make.com / N8N Integration
 Skyvern supports Zapier, Make.com, and N8N to allow you to connect your Skyvern workflows to other apps.
@@ -520,7 +524,6 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 | Azure OpenAI | Any GPT models. Better performance with a multimodal llm (azure/gpt4-o) |
 | AWS Bedrock | Claude 3.5, Claude 3.7, Claude 4 (Sonnet, Opus), Claude 4.5 (Sonnet, Opus) |
 | Gemini | Gemini 3 Pro/Flash, Gemini 2.5 Pro/Flash |
-| MiniMax | MiniMax-M2.5, MiniMax-M2.5-highspeed (204K context) |
 | Ollama | Run any locally hosted model via [Ollama](https://github.com/ollama/ollama) |
 | OpenRouter | Access models through [OpenRouter](https://openrouter.ai) |
 | OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)) |
@@ -570,15 +573,6 @@ Recommended `LLM_KEY`: `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE`, `BE
 | `GEMINI_API_KEY` | Gemini API Key| String | `your_google_gemini_api_key`|
 
 Recommended `LLM_KEY`: `GEMINI_3.0_FLASH`, `GEMINI_2.5_PRO`, `GEMINI_2.5_FLASH`, `GEMINI_2.5_PRO_PREVIEW`, `GEMINI_2.5_FLASH_PREVIEW`
-
-##### MiniMax
-| Variable | Description| Type | Sample Value|
-| -------- | ------- | ------- | ------- |
-| `ENABLE_MINIMAX`| Register MiniMax models | Boolean | `true`, `false` |
-| `MINIMAX_API_KEY` | MiniMax API key | String | `your-minimax-api-key` |
-| `MINIMAX_API_BASE` | MiniMax API base URL | String | `https://api.minimax.io/v1` |
-
-Recommended `LLM_KEY`: `MINIMAX_M2_5`, `MINIMAX_M2_5_HIGHSPEED`
 
 ##### Ollama
 | Variable | Description| Type | Sample Value|

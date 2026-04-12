@@ -11,6 +11,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.utils.templating import replace_jinja_reference
@@ -1074,14 +1075,20 @@ class WorkflowCreateYAMLRequest(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
-    run_with: str | None = None
+    run_with: str = "agent"
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
+    code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False
     run_sequentially: bool = False
     sequential_key: str | None = None
     folder_id: str | None = None
+
+    @field_validator("run_with", mode="before")
+    @classmethod
+    def _normalize_run_with(cls, v: str | None) -> str:
+        return normalize_run_with(v)
 
 
 class WorkflowRequest(BaseModel):
