@@ -192,6 +192,7 @@ export type Parameter =
 export type WorkflowBlock =
   | TaskBlock
   | ForLoopBlock
+  | WhileLoopBlock
   | ConditionalBlock
   | TextPromptBlock
   | CodeBlock
@@ -213,11 +214,14 @@ export type WorkflowBlock =
   | URLBlock
   | HttpRequestBlock
   | PrintPageBlock
-  | WorkflowTriggerBlock;
+  | WorkflowTriggerBlock
+  | GoogleSheetsReadBlock
+  | GoogleSheetsWriteBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
   ForLoop: "for_loop",
+  WhileLoop: "while_loop",
   Conditional: "conditional",
   Code: "code",
   TextPrompt: "text_prompt",
@@ -240,6 +244,8 @@ export const WorkflowBlockTypes = {
   HttpRequest: "http_request",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
+  GoogleSheetsRead: "google_sheets_read",
+  GoogleSheetsWrite: "google_sheets_write",
 } as const;
 
 // all of them
@@ -265,6 +271,12 @@ export function isTaskVariantBlock(item: {
   return scriptableWorkflowBlockTypes.has(item.block_type);
 }
 
+export function isNestedLoopWorkflowBlock(
+  block: WorkflowBlock,
+): block is ForLoopBlock | WhileLoopBlock {
+  return block.block_type === "for_loop" || block.block_type === "while_loop";
+}
+
 export type WorkflowBlockType =
   (typeof WorkflowBlockTypes)[keyof typeof WorkflowBlockTypes];
 
@@ -288,10 +300,12 @@ export type WorkflowBlockBase = {
   next_loop_on_failure?: boolean;
   model: WorkflowModel | null;
   next_block_label?: string | null;
+  ignore_workflow_system_prompt?: boolean;
 };
 
 export const BranchCriteriaTypes = {
   Jinja2Template: "jinja2_template",
+  Prompt: "prompt",
 } as const;
 
 export type BranchCriteriaType =
@@ -357,6 +371,12 @@ export type ForLoopBlock = WorkflowBlockBase & {
   data_schema?: Record<string, unknown> | string | null;
 };
 
+export type WhileLoopBlock = WorkflowBlockBase & {
+  block_type: "while_loop";
+  loop_blocks: Array<WorkflowBlock>;
+  condition: BranchCriteria;
+};
+
 export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
   code: string;
@@ -410,7 +430,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
 export type FileURLParserBlock = WorkflowBlockBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv" | "excel" | "pdf" | "image";
+  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx";
   json_schema: Record<string, unknown> | null;
 };
 
@@ -571,11 +591,35 @@ export type WorkflowTriggerBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type GoogleSheetsReadBlock = WorkflowBlockBase & {
+  block_type: "google_sheets_read";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  has_header_row: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
+  block_type: "google_sheets_write";
+  spreadsheet_url: string;
+  sheet_name: string | null;
+  range: string | null;
+  credential_id: string | null;
+  write_mode: "append" | "update";
+  values: string;
+  column_mapping: Record<string, string> | null;
+  create_sheet_if_missing?: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type WorkflowDefinition = {
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
   finally_block_label?: string | null;
+  workflow_system_prompt?: string | null;
 };
 
 export type WorkflowApiResponse = {
@@ -592,6 +636,7 @@ export type WorkflowApiResponse = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   persist_browser_session: boolean;
+  browser_profile_id?: string | null;
   model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
@@ -615,6 +660,7 @@ export type WorkflowSettings = {
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
+  browserProfileId: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
@@ -625,6 +671,7 @@ export type WorkflowSettings = {
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
+  workflowSystemPrompt: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

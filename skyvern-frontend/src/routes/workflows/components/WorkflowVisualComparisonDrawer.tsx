@@ -15,6 +15,7 @@ import { FlowRenderer } from "../editor/FlowRenderer";
 import { getElements } from "../editor/workflowEditorUtils";
 import { ProxyLocation } from "@/api/types";
 import { AppNode } from "../editor/nodes";
+import { areBlocksIdentical } from "../util/compareBlocks";
 
 type BlockComparison = {
   leftBlock?: WorkflowBlock;
@@ -32,23 +33,6 @@ type Props = {
 
 function getBlockIdentifier(block: WorkflowBlock): string {
   return `${block.block_type}:${block.label}`;
-}
-
-function areBlocksIdentical(
-  block1: WorkflowBlock,
-  block2: WorkflowBlock,
-): boolean {
-  // Convert blocks to string representation for comparison
-  // Remove dynamic fields that shouldn't affect equality
-  const normalize = (block: WorkflowBlock) => {
-    const normalized = { ...block };
-    // Remove output_parameter as it might have different IDs
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const { output_parameter, ...rest } = normalized;
-    return JSON.stringify(rest, Object.keys(rest).sort());
-  };
-
-  return normalize(block1) === normalize(block2);
 }
 
 function compareWorkflowBlocks(
@@ -119,6 +103,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
+    browserProfileId: version.browser_profile_id ?? null,
     model: version.model,
     maxScreenshotScrolls: version.max_screenshot_scrolls || 3,
     extraHttpHeaders: version.extra_http_headers
@@ -131,6 +116,8 @@ function getWorkflowElements(version: WorkflowVersion) {
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
+    workflowSystemPrompt:
+      version.workflow_definition?.workflow_system_prompt ?? null,
   };
 
   return getElements(

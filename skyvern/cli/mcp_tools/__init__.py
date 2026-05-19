@@ -5,8 +5,44 @@ and workflow management. Tools are registered with FastMCP and can be used by
 AI assistants like Claude.
 """
 
-from fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from __future__ import annotations
+
+from typing import Any
+
+try:
+    from fastmcp import FastMCP as _FastMCP
+    from mcp.types import ToolAnnotations
+except ImportError as fastmcp_import_error:
+    _FASTMCP_IMPORT_ERROR: ImportError | None = fastmcp_import_error
+
+    class ToolAnnotations:  # type: ignore[no-redef]
+        def __init__(self, **_: Any) -> None:
+            pass
+
+    class _FastMCP:  # type: ignore[no-redef]
+        def __init__(self, *_: Any, **__: Any) -> None:
+            pass
+
+        def add_middleware(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def tool(self, *_: Any, **__: Any) -> Any:
+            def decorator(func: Any) -> Any:
+                return func
+
+            return decorator
+
+        def prompt(self, *_: Any, **__: Any) -> Any:
+            def decorator(func: Any) -> Any:
+                return func
+
+            return decorator
+
+        def run(self, *_: Any, **__: Any) -> None:
+            raise _FASTMCP_IMPORT_ERROR or ImportError("fastmcp is required to run the Skyvern MCP server.")
+
+else:
+    _FASTMCP_IMPORT_ERROR = None
 
 from .blocks import (
     skyvern_block_schema,
@@ -65,7 +101,22 @@ from .inspection import (
     skyvern_network_route,
     skyvern_network_unroute,
 )
+from .org import (
+    skyvern_org_get,
+    skyvern_org_update,
+)
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
+from .response import size_capped
+from .schedule import (
+    skyvern_schedule_create,
+    skyvern_schedule_delete,
+    skyvern_schedule_disable,
+    skyvern_schedule_enable,
+    skyvern_schedule_get,
+    skyvern_schedule_list,
+    skyvern_schedule_list_for_workflow,
+    skyvern_schedule_update,
+)
 from .scripts import (
     skyvern_script_deploy,
     skyvern_script_fallback_episodes,
@@ -94,7 +145,6 @@ from .tabs import (
     skyvern_tab_switch,
     skyvern_tab_wait_for_new,
 )
-from .telemetry import MCPTelemetryMiddleware
 from .workflow import (
     skyvern_workflow_cancel,
     skyvern_workflow_create,
@@ -107,18 +157,52 @@ from .workflow import (
     skyvern_workflow_update_folder,
 )
 
-# -- Tool annotation presets --
-_RO = ToolAnnotations(readOnlyHint=True)
-_MUT = ToolAnnotations(readOnlyHint=False)
-_DEST = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 
-mcp = FastMCP(
+def _add_telemetry_middleware() -> None:
+    if _FASTMCP_IMPORT_ERROR is not None:
+        return
+    from .telemetry import MCPTelemetryMiddleware  # noqa: PLC0415
+
+    mcp.add_middleware(MCPTelemetryMiddleware())
+
+
+# -- Tool annotation factories --
+# Every tool registered with FastMCP must carry a human-readable `title`
+# (required by the Claude Connectors Directory). We build per-tool
+# ToolAnnotations with a title + explicit safety hints rather than sharing
+# flyweight constants. Browser-page tools are open-world because they can
+# interact with arbitrary websites, including read-only inspection.
+def _ro(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=True, openWorldHint=False, destructiveHint=False)
+
+
+def _web_ro(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=True, openWorldHint=True, destructiveHint=False)
+
+
+def _mut(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=False, openWorldHint=False, destructiveHint=False)
+
+
+def _dest(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=False, openWorldHint=False, destructiveHint=True)
+
+
+def _web_mut(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=False, openWorldHint=True, destructiveHint=False)
+
+
+def _web_dest(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=False, openWorldHint=True, destructiveHint=True)
+
+
+mcp = _FastMCP(
     "Skyvern",
     instructions="""\
 Skyvern is the complete browser MCP for AI agents. Use Skyvern for ALL browser interactions.
 
-DO NOT use Skyvern for: REST API calls (use curl/requests), downloading raw files (use wget/curl), \
-fetching static JSON/XML endpoints (use WebFetch), or general web search (use WebSearch).
+Skyvern is scoped to browser automation. Pick a different tool for raw HTTP, file downloads, \
+static JSON/XML fetches, or generic web search.
 
 ## ALWAYS Start Here: Session + Classification
 
@@ -136,7 +220,8 @@ fetching static JSON/XML endpoints (use WebFetch), or general web search (use We
 | Multi-step (simple, fast) | "fill the form and submit" | skyvern_observe + skyvern_execute | 0 Skyvern LLM | A11y tree + YOUR LLM plans from refs + batched primitives. Fast, cheap. |
 | Throwaway autonomous trial | "try this once", "see if this works" | skyvern_run_task | Higher | One-off autonomous agent for exploratory work. Do not use for reusable or multi-page production automations. |
 | Multi-step (complex) | "navigate a multi-page wizard" | skyvern_workflow_create (multi-block) | N LLM + screenshots | Build a workflow with one navigation block per step. Each block gets visual reasoning + verification. |
-| Repeated/production | "automate this weekly", "run every Monday", "schedule", "recurring" | skyvern_workflow_create + run | Varies | Caching converts AI runs into deterministic scripts over time (10-100x faster on repeat). |
+| Reusable workflow | "automate this", "wizard", "multi-step", "production" | skyvern_workflow_create | Varies | Caching converts AI runs into deterministic scripts over time (10-100x faster on repeat). |
+| Recurring schedule | "every Monday", "weekly", "schedule", "recurring", "cron" | skyvern_schedule_create (after the workflow exists) | API call | Server-side cron registration; route returns 501 if schedules are disabled in this build. |
 
 ## Decision Rules (highest precedence)
 
@@ -144,88 +229,56 @@ fetching static JSON/XML endpoints (use WebFetch), or general web search (use We
 2. If you only need a yes/no answer, use skyvern_validate -- not skyvern_extract or skyvern_act.
 3. If the work stays on one page and the UI is standard, prefer skyvern_observe + skyvern_execute.
 4. If the user says "try this once", "see if this works", or clearly wants a one-off exploratory trial, use skyvern_run_task.
-5. If the task spans multiple pages and is meant to be reusable, scheduled, repeatable, or explicitly "set up" as automation, use skyvern_workflow_create.
+5. If the task spans multiple pages and is meant to be reusable/repeatable, use skyvern_workflow_create. To run it on a recurring cadence, follow up with skyvern_schedule_create against the resulting workflow_permanent_id.
 6. Never type passwords. Always use skyvern_login with stored credentials.
 
-## Quick Start by Classification
+## Quick Reference (one example per classification)
 
-**Quick check:** skyvern_validate(prompt="Is the user logged in?")
-
-**Quick inspection:** skyvern_extract(prompt="Extract all prices", schema='{"type":"object","properties":{...}}')
-
-**Single action (known):** skyvern_click(selector="#submit") or skyvern_type(selector="#email", text="user@co.com")
-
-**Single action (unknown):** skyvern_act(prompt="Click the Sign In button")
-
-**Multi-step (simple) — PREFERRED for forms and standard UI:**
-1. skyvern_observe() -- returns element refs (e0, e1, ...)
-2. Your LLM plans which refs to interact with
-3. skyvern_execute(steps=[{"tool":"click","params":{"ref":"e0"}}, {"tool":"type","params":{"ref":"e1","text":"hello"}}])
-
-**Throwaway autonomous trial:**
-skyvern_run_task(prompt="Try the checkout flow once and tell me whether it succeeds")
-
-**Multi-step (complex) — build a workflow with one block per step:**
-skyvern_workflow_create(
-  definition='{"title":"Checkout","workflow_definition":{"blocks":[{"block_type":"navigation","label":"shipping","navigation_goal":"Fill shipping info"},{"block_type":"navigation","label":"payment","navigation_goal":"Select payment and submit"},{"block_type":"extraction","label":"confirm","data_extraction_goal":"Extract order number"}]}}',
-  format="json"
-) -> skyvern_workflow_run(workflow_id="wpid_...") -> skyvern_workflow_status(run_id="wr_...")
-
-**QA testing:** Use the qa_test prompt to test frontend changes — reads git diff, generates + runs browser tests.
+- **Quick check:** skyvern_validate(prompt="Is the user logged in?")
+- **Inspection:** skyvern_extract(prompt="Extract all prices", schema='{"type":"object","properties":{...}}')
+- **Known selector:** skyvern_click(selector="#submit") or skyvern_type(selector="#email", text="user@co.com")
+- **Unknown target:** skyvern_act(prompt="Click the Sign In button")
+- **Multi-step form:** skyvern_observe() -> skyvern_execute(steps=[...])
+- **One-off trial:** skyvern_run_task(prompt="Try the checkout flow once")
+- **Reusable workflow:** skyvern_workflow_create(definition='{"title":"...","workflow_definition":{"blocks":[...]}}', format="json")
 
 ## Key Warnings
 
-1. **act has NO screenshots** in its LLM reasoning. It uses an economy accessibility tree. \
-Fine for well-labeled elements. For visually complex targets, use skyvern_observe then skyvern_click with the ref.
-2. **observe+execute is DIFFERENT from workflows.** observe+execute uses the accessibility tree and YOUR LLM plans \
-(no Skyvern LLM calls, fast/cheap). Workflows use the full ForgeAgent per block with screenshots + visual reasoning (reliable).
-3. **validate is the cheapest AI option** for yes/no — prefer it over extract or act for boolean checks.
-4. **extract DOES use screenshots** (unlike act) with a dedicated extraction LLM. Better than screenshot then read.
-5. **NEVER type passwords** through skyvern_type or skyvern_act. Use skyvern_login with stored credentials.
+1. **act has NO screenshots** — uses economy a11y tree. For visual targets, use observe then click with ref.
+2. **observe+execute ≠ workflows.** observe+execute: YOUR LLM plans, no Skyvern calls. Workflows: full ForgeAgent per block with screenshots.
+3. **validate is cheapest AI** for yes/no. **extract uses screenshots** with dedicated LLM.
+4. **NEVER type passwords** — use skyvern_login with stored credentials.
 
 ## Tool Tiers
 
-### Tier 1: AI Tools (use when you have a goal but don't know exact selectors)
-These use AI and cost tokens, but cached results enable free re-execution.
-- **skyvern_act**(prompt) — single-page action. No screenshots. 2-3 LLM calls.
-- **skyvern_extract**(prompt, schema?) — structured data WITH screenshots + dedicated extraction LLM.
-- **skyvern_validate**(prompt) — boolean check WITH screenshots. Cheapest AI.
-- **skyvern_observe**() — a11y tree snapshot with element refs (e0, e1...). No LLM calls.
-- **skyvern_execute**(steps) — batch primitives using refs from observe. No Skyvern LLM calls.
-- **skyvern_run_task**(prompt) — one-off exploratory agent. Do not use when the user is asking to set up, automate, schedule, or reuse the flow.
-- **skyvern_login**(credential_id) — AI-powered login with stored credentials.
-
-### Tier 2: Browser Primitives (use when you know the exact selector)
-Zero AI cost. Deterministic. Support intent, selector, or hybrid targeting.
-- **Interaction:** click, type, hover, scroll, select_option, press_key, wait, drag, file_upload, find
-- **Navigation:** navigate, screenshot, evaluate
+**Tier 1 — Goal-Oriented Tools** (mixed cost):
+- **AI-powered** (cost Skyvern LLM tokens): act, extract, validate, run_task, login
+- **Zero Skyvern LLM** (your LLM plans, Skyvern executes): observe, execute
+**Tier 2 — Browser Primitives** (zero AI cost): click, type, hover, scroll, select_option, press_key, wait, drag, \
+file_upload, find, navigate, screenshot, evaluate
 - **Tabs:** tab_list, tab_new, tab_switch, tab_close, tab_wait_for_new
-- **Inspection:** console_messages, network_requests, network_request_detail, get_errors, \
-get_html, get_value, get_styles
-- **Network:** network_route, network_unroute, har_start, har_stop
 - **Frames:** frame_list, frame_switch, frame_main
-- **Storage:** state_save, state_load, get/set/clear_session_storage, clear_local_storage
+- **Inspection:** console_messages, network_requests, network_request_detail, get_errors, get_html, get_value, get_styles
+- **Network:** network_route, network_unroute, har_start, har_stop
+- **Storage:** state_save, state_load, get_session_storage, set_session_storage, clear_session_storage, clear_local_storage
 - **Other:** clipboard_read, clipboard_write, handle_dialog
-
-Precision tools support three targeting modes:
-1. **Intent mode**: skyvern_click(intent="the Submit button") — AI finds element
-2. **Selector mode**: skyvern_click(selector="#submit-btn") — deterministic
-3. **Hybrid mode**: skyvern_click(selector="#submit-btn", intent="the Submit button") — selector narrows, AI confirms
-
-### Tier 3: Management (no browser session needed)
+**Tier 3 — Management** (no session needed):
 - **Sessions:** browser_session_create/close/list/get/connect
 - **Workflows:** workflow_create/run/status/get/list/update/delete/cancel/update_folder
+- **Schedules:** schedule_list/list_for_workflow/get/create/update/enable/disable/delete
 - **Scripts:** script_list_for_workflow, script_get_code, script_versions, script_fallback_episodes, script_deploy
 - **Credentials:** credential_list/get/delete
-- **Folders:** folder_list/get/create/update/delete
-- **Blocks:** block_schema, block_validate
+- **Folders/Blocks:** folder_list/get/create/update/delete, block_schema, block_validate
+
+Precision tools support intent (AI), selector (deterministic), or hybrid (both) targeting.
 
 ### Dependencies
-- extract and validate read the CURRENT page — navigate first.
+- extract/validate read the CURRENT page — navigate first.
 - login requires a session AND a credential_id from credential_list.
 - file_upload requires a navigated page with an upload element.
 - console_messages and network_requests capture events from session start — call anytime.
-- Workflow, credential, script, folder, and block tools do NOT need a browser session.
+- Workflow, schedule, credential, script, folder, and block tools do NOT need a browser session.
+- schedule_create requires an existing workflow_permanent_id — call workflow_list or workflow_create first.
 
 ## Session Lifecycle
 
@@ -268,34 +321,12 @@ navigation (most common), extraction, for_loop, conditional, code, text_prompt, 
 wait, login, validation, http_request, send_email, file_download, file_upload. \
 Call skyvern_block_schema() for full schemas.
 
-## Common Patterns
+## Scripts (ONLY when user explicitly asks)
 
-**Logging in securely:**
-1. skyvern_credential_list -- find the credential
-2. skyvern_browser_session_create -- start session
-3. skyvern_navigate(url="https://login.example.com") -- go to login page
-4. skyvern_login(credential_id="cred_...") -- AI handles the full login flow
-5. skyvern_screenshot -- verify login succeeded
-
-**Debugging browser issues:**
-skyvern_browser_session_create -> skyvern_navigate -> perform actions -> \
-skyvern_console_messages(level="error") for JS errors, skyvern_network_requests for API calls
-
-**Testing feasibility before building a workflow:**
-Walk through the site interactively -- use skyvern_act on each page and skyvern_screenshot to verify. \
-Once confirmed, compose steps into a workflow with skyvern_workflow_create.
-
-## Writing Scripts (ONLY when user explicitly asks)
-
-Use the Skyvern Python SDK: from skyvern import Skyvern. \
-NEVER import from skyvern.cli.mcp_tools -- those are internal server modules.
-In verbose mode (--verbose), every tool response includes an sdk_equivalent field for script conversion.
-
-**Hybrid xpath+prompt pattern** -- the recommended approach for production scripts:
-  await page.click("xpath=//button[@id='submit']", prompt="the Submit button")
-  await page.fill("xpath=//input[@name='email']", "user@example.com", prompt="email input field")
-This tries the xpath first (fast, deterministic) and falls back to AI if the selector breaks. \
-To get xpaths, use skyvern_click -- its resolved_selector response field gives you the xpath.
+Use the Skyvern Python SDK: from skyvern import Skyvern. NEVER import from skyvern.cli.mcp_tools.
+In verbose mode (--verbose), tool responses include sdk_equivalent for script conversion.
+The hybrid xpath+prompt pattern tries xpath first (fast) and falls back to AI if the selector breaks. \
+Use skyvern_click's resolved_selector response to get xpaths for production scripts.
 
 ## Critical Rules
 1. Create a session (skyvern_browser_session_create) before any browser tool.
@@ -305,114 +336,134 @@ To get xpaths, use skyvern_click -- its resolved_selector response field gives y
 5. NEVER create single-block workflows with long prompts — split into one block per step.
 """,
 )
-mcp.add_middleware(MCPTelemetryMiddleware())
+_add_telemetry_middleware()
 
 # -- Browser session management --
-mcp.tool(tags={"session"}, annotations=_MUT)(skyvern_browser_session_create)
-mcp.tool(tags={"session"}, annotations=_DEST)(skyvern_browser_session_close)
-mcp.tool(tags={"session"}, annotations=_RO)(skyvern_browser_session_list)
-mcp.tool(tags={"session"}, annotations=_RO)(skyvern_browser_session_get)
-mcp.tool(tags={"session"}, annotations=_RO)(skyvern_browser_session_connect)
+mcp.tool(tags={"session"}, annotations=_mut("Create Browser Session"))(skyvern_browser_session_create)
+mcp.tool(tags={"session"}, annotations=_dest("Close Browser Session"))(skyvern_browser_session_close)
+mcp.tool(tags={"session"}, annotations=_ro("List Browser Sessions"))(skyvern_browser_session_list)
+mcp.tool(tags={"session"}, annotations=_ro("Get Browser Session"))(skyvern_browser_session_get)
+mcp.tool(tags={"session"}, annotations=_web_mut("Connect to Browser Session"))(skyvern_browser_session_connect)
 
 # -- Primary tools (AI-powered exploration + observation) --
-mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_MUT)(skyvern_act)
-mcp.tool(tags={"ai_powered"}, annotations=_RO)(skyvern_extract)
-mcp.tool(tags={"ai_powered"}, annotations=_RO)(skyvern_validate)
-mcp.tool(tags={"ai_powered"}, annotations=_MUT)(skyvern_run_task)
-mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_MUT)(skyvern_login)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_navigate)
-mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_screenshot)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_evaluate)
+# Browser tools run against arbitrary websites. Read-only inspection remains
+# non-destructive, but still open-world because the target site is unbounded.
+mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_dest("Perform Browser Action (AI)"))(skyvern_act)
+mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(size_capped(skyvern_extract))
+mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Validate Page Condition (AI)"))(skyvern_validate)
+mcp.tool(tags={"ai_powered"}, annotations=_web_dest("Run Autonomous Browser Task (AI)"))(skyvern_run_task)
+mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_mut("Log in to Website (AI)"))(skyvern_login)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL"))(skyvern_navigate)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Take Screenshot"))(skyvern_screenshot)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Evaluate JavaScript"))(skyvern_evaluate)
 
 # -- Clipboard --
-mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_clipboard_read)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_clipboard_write)
+mcp.tool(tags={"browser_primitive"}, annotations=_ro("Read Clipboard"))(skyvern_clipboard_read)
+mcp.tool(tags={"browser_primitive"}, annotations=_mut("Write Clipboard"))(skyvern_clipboard_write)
 
 # -- Batch tools (observe + execute for multi-step optimization) --
-mcp.tool(tags={"browser_primitive", "batch"}, annotations=_RO)(skyvern_observe)
-mcp.tool(tags={"browser_primitive", "batch"}, annotations=_MUT)(skyvern_execute)
+mcp.tool(tags={"browser_primitive", "batch"}, annotations=_web_ro("Observe Page Structure"))(skyvern_observe)
+mcp.tool(tags={"browser_primitive", "batch"}, annotations=_web_dest("Execute Batch Actions"))(skyvern_execute)
 
 # -- Precision tools (selector/intent-based browser primitives) --
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_click)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_drag)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_file_upload)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_hover)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_type)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_scroll)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_select_option)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_press_key)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_wait)
-mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_find)
+# Input/action primitives can submit, overwrite, or delete arbitrary website state.
+# Passive pointer/scroll state changes are open-world but non-destructive.
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Click Element"))(skyvern_click)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Drag Element"))(skyvern_drag)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Upload File"))(skyvern_file_upload)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Hover Element"))(skyvern_hover)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Type Text"))(skyvern_type)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Scroll Page"))(skyvern_scroll)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Select Option"))(skyvern_select_option)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Press Key"))(skyvern_press_key)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Wait"))(skyvern_wait)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Find Element"))(skyvern_find)
 
 # -- Tab management (multi-tab) --
-mcp.tool(tags={"tab_management"}, annotations=_RO)(skyvern_tab_list)
-mcp.tool(tags={"tab_management"}, annotations=_MUT)(skyvern_tab_new)
-mcp.tool(tags={"tab_management"}, annotations=_MUT)(skyvern_tab_switch)
-mcp.tool(tags={"tab_management"}, annotations=_DEST)(skyvern_tab_close)
-mcp.tool(tags={"tab_management"}, annotations=_RO)(skyvern_tab_wait_for_new)
+mcp.tool(tags={"tab_management"}, annotations=_web_ro("List Tabs"))(skyvern_tab_list)
+mcp.tool(tags={"tab_management"}, annotations=_web_mut("Open New Tab"))(skyvern_tab_new)
+mcp.tool(tags={"tab_management"}, annotations=_mut("Switch Tab"))(skyvern_tab_switch)
+mcp.tool(tags={"tab_management"}, annotations=_dest("Close Tab"))(skyvern_tab_close)
+mcp.tool(tags={"tab_management"}, annotations=_web_ro("Wait for New Tab"))(skyvern_tab_wait_for_new)
 
 # -- Frame management (iframe switching) --
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_frame_switch)
-mcp.tool(tags={"browser_primitive"}, annotations=_MUT)(skyvern_frame_main)
-mcp.tool(tags={"browser_primitive"}, annotations=_RO)(skyvern_frame_list)
+mcp.tool(tags={"browser_primitive"}, annotations=_mut("Switch Iframe"))(skyvern_frame_switch)
+mcp.tool(tags={"browser_primitive"}, annotations=_mut("Switch to Main Frame"))(skyvern_frame_main)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("List Iframes"))(skyvern_frame_list)
 
 # -- Auth state persistence --
-mcp.tool(tags={"state"}, annotations=_MUT)(skyvern_state_save)
-mcp.tool(tags={"state"}, annotations=_MUT)(skyvern_state_load)
+mcp.tool(tags={"state"}, annotations=_web_mut("Save Browser State"))(skyvern_state_save)
+mcp.tool(tags={"state"}, annotations=_web_mut("Load Browser State"))(skyvern_state_load)
 
 # -- Inspection tools (console, network, dialog, page errors, DOM) --
-mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_console_messages)
-mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_requests)
-mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_network_request_detail)
-mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_network_route)
-mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_network_unroute)
-mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_handle_dialog)
-mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_errors)
-mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_har_start)
-mcp.tool(tags={"inspection"}, annotations=_MUT)(skyvern_har_stop)
-mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_html)
-mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_value)
-mcp.tool(tags={"inspection"}, annotations=_RO)(skyvern_get_styles)
+# console_messages, network_requests, handle_dialog, and get_errors accept
+# clear=True, which mutates captured session buffers.
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Get Console Messages"))(skyvern_console_messages)
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Get Network Requests"))(size_capped(skyvern_network_requests))
+mcp.tool(tags={"inspection"}, annotations=_web_ro("Get Network Request Detail"))(skyvern_network_request_detail)
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Route Network Requests"))(skyvern_network_route)
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Remove Network Route"))(skyvern_network_unroute)
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Handle Browser Dialog"))(skyvern_handle_dialog)
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Get Page Errors"))(skyvern_get_errors)
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Start HAR Recording"))(skyvern_har_start)
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Stop HAR Recording"))(size_capped(skyvern_har_stop))
+mcp.tool(tags={"inspection"}, annotations=_web_ro("Get Element HTML"))(size_capped(skyvern_get_html))
+mcp.tool(tags={"inspection"}, annotations=_web_ro("Get Element Value"))(skyvern_get_value)
+mcp.tool(tags={"inspection"}, annotations=_web_ro("Get Element Styles"))(skyvern_get_styles)
 
 # -- Web storage (sessionStorage + localStorage) --
-mcp.tool(tags={"storage"}, annotations=_RO)(skyvern_get_session_storage)
-mcp.tool(tags={"storage"}, annotations=_MUT)(skyvern_set_session_storage)
-mcp.tool(tags={"storage"}, annotations=_DEST)(skyvern_clear_session_storage)
-mcp.tool(tags={"storage"}, annotations=_DEST)(skyvern_clear_local_storage)
+mcp.tool(tags={"storage"}, annotations=_web_ro("Get Session Storage"))(skyvern_get_session_storage)
+mcp.tool(tags={"storage"}, annotations=_web_mut("Set Session Storage"))(skyvern_set_session_storage)
+mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Session Storage"))(skyvern_clear_session_storage)
+mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Local Storage"))(skyvern_clear_local_storage)
 
 # -- Block discovery + validation (no browser needed) --
-mcp.tool(tags={"block_discovery"}, annotations=_RO)(skyvern_block_schema)
-mcp.tool(tags={"block_discovery"}, annotations=_RO)(skyvern_block_validate)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))(skyvern_block_schema)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
+
+# -- Organization settings (no browser needed) --
+mcp.tool(tags={"settings"}, annotations=_ro("Get Organization Settings"))(skyvern_org_get)
+mcp.tool(tags={"settings"}, annotations=_mut("Update Organization Settings"))(skyvern_org_update)
 
 # -- Credential lookup (no browser needed) --
-mcp.tool(tags={"credential"}, annotations=_RO)(skyvern_credential_list)
-mcp.tool(tags={"credential"}, annotations=_RO)(skyvern_credential_get)
-mcp.tool(tags={"credential"}, annotations=_DEST)(skyvern_credential_delete)
+mcp.tool(tags={"credential"}, annotations=_ro("List Credentials"))(skyvern_credential_list)
+mcp.tool(tags={"credential"}, annotations=_ro("Get Credential"))(skyvern_credential_get)
+mcp.tool(tags={"credential"}, annotations=_dest("Delete Credential"))(skyvern_credential_delete)
 
 # -- Folder management (no browser needed) --
-mcp.tool(tags={"folder"}, annotations=_RO)(skyvern_folder_list)
-mcp.tool(tags={"folder"}, annotations=_MUT)(skyvern_folder_create)
-mcp.tool(tags={"folder"}, annotations=_RO)(skyvern_folder_get)
-mcp.tool(tags={"folder"}, annotations=_MUT)(skyvern_folder_update)
-mcp.tool(tags={"folder"}, annotations=_DEST)(skyvern_folder_delete)
+mcp.tool(tags={"folder"}, annotations=_ro("List Folders"))(skyvern_folder_list)
+mcp.tool(tags={"folder"}, annotations=_mut("Create Folder"))(skyvern_folder_create)
+mcp.tool(tags={"folder"}, annotations=_ro("Get Folder"))(skyvern_folder_get)
+mcp.tool(tags={"folder"}, annotations=_mut("Update Folder"))(skyvern_folder_update)
+mcp.tool(tags={"folder"}, annotations=_dest("Delete Folder"))(skyvern_folder_delete)
 
 # -- Workflow management (CRUD + execution, no browser needed) --
-mcp.tool(tags={"workflow"}, annotations=_RO)(skyvern_workflow_list)
-mcp.tool(tags={"workflow"}, annotations=_RO)(skyvern_workflow_get)
-mcp.tool(tags={"workflow"}, annotations=_MUT)(skyvern_workflow_create)
-mcp.tool(tags={"workflow"}, annotations=_MUT)(skyvern_workflow_update)
-mcp.tool(tags={"workflow"}, annotations=_MUT)(skyvern_workflow_update_folder)
-mcp.tool(tags={"workflow"}, annotations=_DEST)(skyvern_workflow_delete)
-mcp.tool(tags={"workflow"}, annotations=_MUT)(skyvern_workflow_run)
-mcp.tool(tags={"workflow"}, annotations=_RO)(skyvern_workflow_status)
-mcp.tool(tags={"workflow"}, annotations=_MUT)(skyvern_workflow_cancel)
+mcp.tool(tags={"workflow"}, annotations=_ro("List Workflows"))(size_capped(skyvern_workflow_list))
+mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow"))(size_capped(skyvern_workflow_get))
+mcp.tool(tags={"workflow"}, annotations=_mut("Create Workflow"))(skyvern_workflow_create)
+mcp.tool(tags={"workflow"}, annotations=_mut("Update Workflow"))(skyvern_workflow_update)
+mcp.tool(tags={"workflow"}, annotations=_mut("Move Workflow to Folder"))(skyvern_workflow_update_folder)
+mcp.tool(tags={"workflow"}, annotations=_dest("Delete Workflow"))(skyvern_workflow_delete)
+mcp.tool(tags={"workflow"}, annotations=_web_dest("Run Workflow"))(skyvern_workflow_run)
+mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow Run Status"))(skyvern_workflow_status)
+mcp.tool(tags={"workflow"}, annotations=_dest("Cancel Workflow Run"))(skyvern_workflow_cancel)
+
+# -- Schedule management (no browser needed) --
+mcp.tool(tags={"schedule"}, annotations=_ro("List Workflow Schedules"))(skyvern_schedule_list)
+mcp.tool(tags={"schedule"}, annotations=_ro("List Schedules for a Workflow"))(skyvern_schedule_list_for_workflow)
+mcp.tool(tags={"schedule"}, annotations=_ro("Get Workflow Schedule"))(skyvern_schedule_get)
+mcp.tool(tags={"schedule"}, annotations=_mut("Create Workflow Schedule"))(skyvern_schedule_create)
+mcp.tool(tags={"schedule"}, annotations=_mut("Update Workflow Schedule"))(skyvern_schedule_update)
+mcp.tool(tags={"schedule"}, annotations=_mut("Enable Workflow Schedule"))(skyvern_schedule_enable)
+mcp.tool(tags={"schedule"}, annotations=_mut("Disable Workflow Schedule"))(skyvern_schedule_disable)
+mcp.tool(tags={"schedule"}, annotations=_dest("Delete Workflow Schedule"))(skyvern_schedule_delete)
 
 # -- Script/caching tools (no browser needed) --
-mcp.tool(tags={"script"}, annotations=_RO)(skyvern_script_list_for_workflow)
-mcp.tool(tags={"script"}, annotations=_RO)(skyvern_script_get_code)
-mcp.tool(tags={"script"}, annotations=_RO)(skyvern_script_versions)
-mcp.tool(tags={"script"}, annotations=_RO)(skyvern_script_fallback_episodes)
-mcp.tool(tags={"script"}, annotations=_MUT)(skyvern_script_deploy)
+mcp.tool(tags={"script"}, annotations=_ro("List Workflow Scripts"))(skyvern_script_list_for_workflow)
+mcp.tool(tags={"script"}, annotations=_ro("Get Script Code"))(size_capped(skyvern_script_get_code))
+mcp.tool(tags={"script"}, annotations=_ro("List Script Versions"))(skyvern_script_versions)
+mcp.tool(tags={"script"}, annotations=_ro("Get Script Fallback Episodes"))(skyvern_script_fallback_episodes)
+mcp.tool(tags={"script"}, annotations=_mut("Deploy Workflow Script"))(skyvern_script_deploy)
 
 # -- Prompts (methodology guides injected into LLM conversations) --
 mcp.prompt()(build_workflow)
@@ -485,6 +536,9 @@ __all__ = [
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
+    # Organization settings
+    "skyvern_org_get",
+    "skyvern_org_update",
     # Credential lookup
     "skyvern_credential_list",
     "skyvern_credential_get",
@@ -505,6 +559,15 @@ __all__ = [
     "skyvern_workflow_run",
     "skyvern_workflow_status",
     "skyvern_workflow_cancel",
+    # Schedule management
+    "skyvern_schedule_list",
+    "skyvern_schedule_list_for_workflow",
+    "skyvern_schedule_get",
+    "skyvern_schedule_create",
+    "skyvern_schedule_update",
+    "skyvern_schedule_enable",
+    "skyvern_schedule_disable",
+    "skyvern_schedule_delete",
     # Script/caching
     "skyvern_script_list_for_workflow",
     "skyvern_script_get_code",

@@ -18,7 +18,6 @@ import yaml
 from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
-from skyvern.client.types import WorkflowCreateYamlRequest
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
@@ -27,6 +26,15 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
 from ._validation import validate_folder_id, validate_run_id, validate_workflow_id
+from ._workflow_http import (
+    coerce_timestamp,
+    create_workflow_raw,
+    get_workflow_by_id,
+    get_workflow_run_status,
+    list_workflows_raw,
+    update_workflow_folder_raw,
+    update_workflow_raw,
+)
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
@@ -43,24 +51,27 @@ _SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workf
 
 
 def _serialize_workflow(wf: Any) -> dict[str, Any]:
-    """Pick the fields we expose from a Workflow Pydantic model.
+    """Pick the fields we expose from a Workflow.
 
-    Uses Any to avoid tight coupling with Fern-generated client types.
+    Accepts both a Fern-generated Workflow pydantic model and a plain dict
+    parsed from a raw httpx JSON response. Uses Any to stay decoupled from
+    Fern-generated client types.
     """
+    status = _get_value(wf, "status")
     data: dict[str, Any] = {
-        "workflow_permanent_id": wf.workflow_permanent_id,
-        "workflow_id": wf.workflow_id,
-        "title": wf.title,
-        "version": wf.version,
-        "status": str(wf.status) if wf.status else None,
-        "description": wf.description,
-        "is_saved_task": wf.is_saved_task,
-        "folder_id": wf.folder_id,
-        "created_at": wf.created_at.isoformat() if wf.created_at else None,
-        "modified_at": wf.modified_at.isoformat() if wf.modified_at else None,
+        "workflow_permanent_id": _get_value(wf, "workflow_permanent_id"),
+        "workflow_id": _get_value(wf, "workflow_id"),
+        "title": _get_value(wf, "title"),
+        "version": _get_value(wf, "version"),
+        "status": str(status) if status else None,
+        "description": _get_value(wf, "description"),
+        "is_saved_task": _get_value(wf, "is_saved_task"),
+        "folder_id": _get_value(wf, "folder_id"),
+        "created_at": coerce_timestamp(_get_value(wf, "created_at")),
+        "modified_at": coerce_timestamp(_get_value(wf, "modified_at")),
     }
     for caching_field in ("run_with", "code_version", "adaptive_caching"):
-        val = getattr(wf, caching_field, None)
+        val = _get_value(wf, caching_field)
         if val is not None:
             data[caching_field] = val
     return data
@@ -69,18 +80,26 @@ def _serialize_workflow(wf: Any) -> dict[str, Any]:
 def _serialize_workflow_full(wf: Any) -> dict[str, Any]:
     """Like _serialize_workflow but includes the full definition."""
     data = _serialize_workflow(wf)
-    if hasattr(wf, "workflow_definition") and wf.workflow_definition is not None:
+    wf_def = _get_value(wf, "workflow_definition")
+    if wf_def is None:
+        return data
+    if hasattr(wf_def, "model_dump"):
         try:
-            data["workflow_definition"] = wf.workflow_definition.model_dump(mode="json")
+            data["workflow_definition"] = wf_def.model_dump(mode="json")
         except Exception:
-            data["workflow_definition"] = str(wf.workflow_definition)
+            data["workflow_definition"] = str(wf_def)
+    elif isinstance(wf_def, dict):
+        data["workflow_definition"] = wf_def
+    else:
+        data["workflow_definition"] = str(wf_def)
     return data
 
 
 def _serialize_run(run: Any) -> dict[str, Any]:
     """Pick fields from a run response (GetRunResponse variant or WorkflowRunResponse).
 
-    Uses Any to avoid tight coupling with Fern-generated client types.
+    Run responses still come from Fern SDK models; unlike workflow CRUD, this
+    path is not part of the raw dict bypass.
     """
     data: dict[str, Any] = {
         "run_id": run.run_id,
@@ -119,6 +138,11 @@ def _serialize_run(run: Any) -> dict[str, Any]:
 
 
 def _get_value(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a field from raw workflow dicts or Fern models without enforcing requiredness.
+
+    Workflow serializers are intentionally permissive here so response shaping
+    does not fail when the backend adds or omits optional fields.
+    """
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
@@ -363,75 +387,15 @@ def _serialize_run_full(run: Any) -> dict[str, Any]:
     return {key: value for key, value in data.items() if value is not None}
 
 
-async def _get_workflow_run_status(
-    workflow_run_id: str,
-    *,
-    include_output_details: bool,
-) -> dict[str, Any]:
-    skyvern = get_skyvern()
-    # The generated SDK only exposes get_run() for /v1/runs/{run_id}; wr_... IDs
-    # require the workflow-run detail route until a public SDK helper exists.
-    response = await skyvern._client_wrapper.httpx_client.request(
-        f"api/v1/workflows/runs/{workflow_run_id}",
-        method="GET",
-        params={"include_output_details": include_output_details},
-    )
-    if response.status_code == 404:
-        raise NotFoundError(body={"detail": f"Workflow run {workflow_run_id!r} not found"})
-    if response.status_code >= 400:
-        detail = ""
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text
-        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
-    return response.json()
-
-
-async def _get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, Any]:
-    """Fetch a single workflow by ID via the Skyvern API.
-
-    The Fern-generated client has get_workflows() (list) but no get_workflow(id).
-    This helper isolates the private client access so the workaround is contained
-    in one place. Replace with ``skyvern.get_workflow(id)`` when the SDK adds it.
-
-    Raises NotFoundError on 404, or RuntimeError on other HTTP errors, so callers
-    can use the same ``except NotFoundError`` pattern as all other workflow tools.
-    """
-    skyvern = get_skyvern()
-    params: dict[str, Any] = {}
-    if version is not None:
-        params["version"] = version
-    # TODO(SKY-7807): Replace with skyvern.get_workflow() when the Fern client adds it.
-    response = await skyvern._client_wrapper.httpx_client.request(
-        f"api/v1/workflows/{workflow_id}",
-        method="GET",
-        params=params,
-    )
-    if response.status_code == 404:
-        raise NotFoundError(body={"detail": f"Workflow {workflow_id!r} not found"})
-    if response.status_code >= 400:
-        detail = ""
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text
-        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
-    return response.json()
-
-
-def _validate_definition_structure(json_def: WorkflowCreateYamlRequest | None, action: str) -> dict[str, Any] | None:
+def _validate_definition_structure(json_def: dict[str, Any] | None, action: str) -> dict[str, Any] | None:
     """Validate required fields in a JSON workflow definition.
 
     Returns a make_result error dict if validation fails, or None if valid.
     Only validates JSON definitions — YAML is validated server-side.
-    Note: WorkflowCreateYamlRequest already enforces ``title`` and
-    ``workflow_definition`` as required fields via Pydantic, so this is
-    a belt-and-suspenders check that produces user-friendly error messages.
     """
     if json_def is None:
         return None
-    if not json_def.title:
+    if not json_def.get("title"):
         return make_result(
             action,
             ok=False,
@@ -439,6 +403,16 @@ def _validate_definition_structure(json_def: WorkflowCreateYamlRequest | None, a
                 ErrorCode.INVALID_INPUT,
                 "Workflow definition missing 'title' field",
                 "Add a 'title' field to your workflow definition",
+            ),
+        )
+    if not isinstance(json_def.get("workflow_definition"), dict):
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Workflow definition missing 'workflow_definition' object",
+                "Add a 'workflow_definition' object with a 'blocks' list",
             ),
         )
     return None
@@ -482,22 +456,33 @@ def _deep_merge(base: Any, override: Any) -> Any:
     return override
 
 
-def _normalize_json_definition(raw: Any) -> WorkflowCreateYamlRequest:
-    """Normalize JSON workflow definitions through the shared backend schema."""
+def _normalize_json_definition(raw: Any) -> dict[str, Any]:
+    """Normalize JSON workflow definitions through the shared backend schema.
+
+    The MCP tools post through raw HTTP so valid backend payloads are not
+    rejected by stale Fern request unions. When the backend schema accepts the
+    payload, merge its JSON-compatible normalization over the raw dict; when it
+    does not, preserve the caller's raw dict for server-side validation.
+    """
 
     if not isinstance(raw, dict):
         raise TypeError("Workflow definition JSON must be an object")
+    if "title" not in raw:
+        raise ValueError("Workflow definition missing 'title' field")
+    if "workflow_definition" not in raw:
+        raise ValueError("Workflow definition missing 'workflow_definition' object")
 
     try:
         normalized = WorkflowCreateYAMLRequestSchema.model_validate(raw)
     except Exception as exc:
-        # Internal schema is stricter than the Fern SDK — skip normalization so
-        # unknown/future fields are not rejected.
+        # Internal schema is stricter than the API boundary — skip normalization
+        # so unknown/future fields are not rejected by MCP before the backend can
+        # decide.
         LOG.warning("Skipping text-prompt normalization; internal schema rejected payload", error=str(exc))
-        return WorkflowCreateYamlRequest(**raw)
+        return raw
 
     merged = _deep_merge(raw, normalized.model_dump(mode="json"))
-    return WorkflowCreateYamlRequest(**merged)
+    return merged
 
 
 def _make_invalid_json_definition_error(exc: Exception) -> dict[str, Any]:
@@ -601,7 +586,7 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
     if raw is None or parsed_format is None or "proxy_location" in raw:
         return definition
 
-    existing_workflow = await _get_workflow_by_id(workflow_id)
+    existing_workflow = await get_workflow_by_id(workflow_id)
     raw["proxy_location"] = existing_workflow.get("proxy_location") or _DEFAULT_MCP_PROXY_LOCATION
     return _dump_definition_dict(raw, parsed_format)
 
@@ -706,7 +691,7 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
 
     update_params: list[dict[str, Any]] = wf_def.get("parameters", [])
 
-    existing_workflow = await _get_workflow_by_id(workflow_id)
+    existing_workflow = await get_workflow_by_id(workflow_id)
     existing_wf_def = existing_workflow.get("workflow_definition")
     if not isinstance(existing_wf_def, dict):
         return definition
@@ -792,14 +777,12 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
     return _dump_definition_dict(raw, parsed_format)
 
 
-def _parse_definition(
-    definition: str, fmt: str
-) -> tuple[WorkflowCreateYamlRequest | None, str | None, dict[str, Any] | None]:
+def _parse_definition(definition: str, fmt: str) -> tuple[dict[str, Any] | None, str | None, dict[str, Any] | None]:
     """Parse a workflow definition string.
 
     Returns (json_definition, yaml_definition, error).
     Exactly one of the first two will be set on success, or error on failure.
-    JSON input is parsed into a WorkflowCreateYamlRequest (the type the SDK expects).
+    JSON input is parsed into a plain dict for raw HTTP submission.
     """
 
     if fmt == "json":
@@ -838,12 +821,10 @@ async def skyvern_workflow_list(
 ) -> dict[str, Any]:
     """Find and browse available Skyvern workflows. Use when you need to discover what workflows exist,
     search for a workflow by name, or list all workflows for an organization."""
-    skyvern = get_skyvern()
-
     with Timer() as timer:
         try:
-            workflows = await skyvern.get_workflows(
-                search_key=search,
+            workflows = await list_workflows_raw(
+                search=search,
                 page=page,
                 page_size=page_size,
                 only_workflows=only_workflows,
@@ -882,7 +863,7 @@ async def skyvern_workflow_get(
 
     with Timer() as timer:
         try:
-            wf_data = await _get_workflow_by_id(workflow_id, version)
+            wf_data = await get_workflow_by_id(workflow_id, version)
             timer.mark("sdk")
         except NotFoundError:
             return make_result(
@@ -921,51 +902,12 @@ async def skyvern_workflow_create(
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
 ) -> dict[str, Any]:
-    """Create a new Skyvern workflow from a YAML or JSON definition. Use when you need to save
-    a new automation workflow that can be run repeatedly with different parameters.
+    """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
+    scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
 
-    By default, workflows created via MCP use Code 2.0 (code_version=2, run_with="code").
-    To disable this, explicitly set "code_version": 1 and/or "run_with": null in your definition.
-
-    Best practice: use one block per logical step with a short focused prompt (2-3 sentences).
-    Use "navigation" blocks for actions (filling forms, clicking) and "extraction" blocks for pulling data.
-    Do NOT use the deprecated "task" block type.
-    Common block types: navigation, extraction, for_loop, conditional, code, text_prompt, action, wait, login.
-    Call skyvern_block_schema() for the full list with schemas and examples.
-
-    Example JSON definition (multi-block EIN application):
-
-        {
-          "title": "Apply for EIN",
-          "workflow_definition": {
-            "parameters": [
-              {"parameter_type": "workflow", "key": "business_name", "workflow_parameter_type": "string"},
-              {"parameter_type": "workflow", "key": "owner_name", "workflow_parameter_type": "string"},
-              {"parameter_type": "workflow", "key": "owner_ssn", "workflow_parameter_type": "string"}
-            ],
-            "blocks": [
-              {"block_type": "navigation", "label": "select_entity_type",
-               "url": "https://sa.www4.irs.gov/modiein/individual/index.jsp",
-               "title": "Select Entity Type",
-               "navigation_goal": "Select 'Sole Proprietor' as the entity type and click Continue."},
-              {"block_type": "navigation", "label": "enter_business_info",
-               "title": "Enter Business Info",
-               "navigation_goal": "Fill in the business name as '{{business_name}}' and click Continue.",
-               "parameter_keys": ["business_name"]},
-              {"block_type": "navigation", "label": "enter_owner_info",
-               "title": "Enter Owner Info",
-               "navigation_goal": "Enter the responsible party name '{{owner_name}}' and SSN '{{owner_ssn}}'. Click Continue.",
-               "parameter_keys": ["owner_name", "owner_ssn"]},
-              {"block_type": "extraction", "label": "extract_ein",
-               "title": "Extract EIN",
-               "data_extraction_goal": "Extract the assigned EIN number from the confirmation page",
-               "data_schema": {"type": "object", "properties": {"ein": {"type": "string"}}}}
-            ]
-          }
-        }
-
-    Use {{parameter_key}} to reference workflow input parameters in any block field.
-    Blocks in the same run share the same browser session automatically.
+    One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
+    Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
+    Defaults to Code 2.0 (run_with="code"). Blocks share a browser session automatically.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(
@@ -994,11 +936,9 @@ async def skyvern_workflow_create(
     if err := _validate_definition_structure(json_def, "skyvern_workflow_create"):
         return err
 
-    skyvern = get_skyvern()
-
     with Timer() as timer:
         try:
-            workflow = await skyvern.create_workflow(
+            workflow = await create_workflow_raw(
                 json_definition=json_def,
                 yaml_definition=yaml_def,
                 folder_id=folder_id,
@@ -1017,7 +957,7 @@ async def skyvern_workflow_create(
                 ),
             )
 
-    LOG.info("workflow_created", workflow_id=workflow.workflow_permanent_id)
+    LOG.info("workflow_created", workflow_id=workflow.get("workflow_permanent_id"))
     data = _serialize_workflow(workflow)
     fmt_label = "json_definition" if json_def is not None else "yaml_definition"
     folder_str = f", folder_id={folder_id!r}" if folder_id is not None else ""
@@ -1080,16 +1020,25 @@ async def skyvern_workflow_update(
     if err := _validate_definition_structure(json_def, "skyvern_workflow_update"):
         return err
 
-    skyvern = get_skyvern()
-
     with Timer() as timer:
         try:
-            workflow = await skyvern.update_workflow(
+            workflow = await update_workflow_raw(
                 workflow_id,
                 json_definition=json_def,
                 yaml_definition=yaml_def,
             )
             timer.mark("sdk")
+        except NotFoundError:
+            return make_result(
+                "skyvern_workflow_update",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.WORKFLOW_NOT_FOUND,
+                    f"Workflow {workflow_id!r} not found",
+                    "Verify the workflow ID with skyvern_workflow_list",
+                ),
+            )
         except Exception as e:
             return make_result(
                 "skyvern_workflow_update",
@@ -1179,11 +1128,9 @@ async def skyvern_workflow_update_folder(
     if folder_id is not None and (err := validate_folder_id(folder_id, "skyvern_workflow_update_folder")):
         return err
 
-    skyvern = get_skyvern()
-
     with Timer() as timer:
         try:
-            workflow = await skyvern.update_workflow_folder(workflow_id, folder_id=folder_id)
+            workflow = await update_workflow_folder_raw(workflow_id, folder_id=folder_id)
             timer.mark("sdk")
         except NotFoundError:
             return make_result(
@@ -1364,7 +1311,7 @@ async def skyvern_workflow_status(
     with Timer() as timer:
         try:
             if run_id.startswith("wr_"):
-                run = await _get_workflow_run_status(
+                run = await get_workflow_run_status(
                     run_id,
                     include_output_details=verbosity == "full",
                 )

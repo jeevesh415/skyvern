@@ -21,11 +21,14 @@ from skyvern.forge.sdk.routes.code_samples import (
     GET_BROWSER_PROFILE_CODE_SAMPLE_TS,
     GET_BROWSER_PROFILES_CODE_SAMPLE_PYTHON,
     GET_BROWSER_PROFILES_CODE_SAMPLE_TS,
+    UPDATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
+    UPDATE_BROWSER_PROFILE_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
     CreateBrowserProfileRequest,
+    UpdateBrowserProfileRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -132,7 +135,17 @@ async def create_browser_profile(
     include_in_schema=False,
 )
 async def list_browser_profiles(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1),
     include_deleted: bool = Query(default=False, description="Include deleted browser profiles"),
+    search_key: str | None = Query(
+        None,
+        description=(
+            "Case-insensitive substring search across: browser profile name and description. "
+            "A profile is returned if either field matches."
+        ),
+        examples=["my_profile", "production"],
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[BrowserProfile]:
     """List all browser profiles for the current organization."""
@@ -141,11 +154,17 @@ async def list_browser_profiles(
         "Listing browser profiles",
         organization_id=organization_id,
         include_deleted=include_deleted,
+        page=page,
+        page_size=page_size,
+        search_key=search_key,
     )
 
     profiles = await app.DATABASE.browser_sessions.list_browser_profiles(
         organization_id=organization_id,
         include_deleted=include_deleted,
+        page=page,
+        page_size=page_size,
+        search_key=search_key,
     )
 
     LOG.info(
@@ -214,6 +233,82 @@ async def get_browser_profile(
 
     LOG.info(
         "Retrieved browser profile",
+        organization_id=organization_id,
+        browser_profile_id=profile_id,
+    )
+    return profile
+
+
+@base_router.patch(
+    "/browser_profiles/{profile_id}",
+    response_model=BrowserProfile,
+    tags=["Browser Profiles"],
+    summary="Update browser profile",
+    description="Update a browser profile's name and/or description",
+    responses={
+        200: {"description": "Successfully updated browser profile"},
+        404: {"description": "Browser profile not found"},
+        409: {"description": "Browser profile name already exists"},
+    },
+    openapi_extra={
+        "x-fern-sdk-method-name": "update_browser_profile",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": UPDATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": UPDATE_BROWSER_PROFILE_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
+    },
+)
+@base_router.patch(
+    "/browser_profiles/{profile_id}/",
+    response_model=BrowserProfile,
+    include_in_schema=False,
+)
+async def update_browser_profile(
+    request: UpdateBrowserProfileRequest,
+    profile_id: str = Path(
+        ...,
+        description="The ID of the browser profile to update. browser_profile_id starts with `bp_`",
+        examples=["bp_123456"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserProfile:
+    organization_id = current_org.organization_id
+    LOG.info(
+        "Updating browser profile",
+        organization_id=organization_id,
+        browser_profile_id=profile_id,
+    )
+
+    try:
+        profile = await app.DATABASE.browser_sessions.update_browser_profile(
+            profile_id=profile_id,
+            organization_id=organization_id,
+            name=request.name,
+            description=request.description,
+        )
+    except BrowserProfileNotFound:
+        LOG.warning(
+            "Browser profile not found for update",
+            organization_id=organization_id,
+            browser_profile_id=profile_id,
+        )
+        raise
+    except IntegrityError as exc:
+        if request.name is None:
+            LOG.exception(
+                "Unexpected integrity error on browser profile update without name change",
+                organization_id=organization_id,
+                browser_profile_id=profile_id,
+            )
+            raise
+        _handle_duplicate_profile_name(organization_id=organization_id, name=request.name, exc=exc)
+
+    LOG.info(
+        "Updated browser profile",
         organization_id=organization_id,
         browser_profile_id=profile_id,
     )
@@ -319,11 +414,14 @@ async def _create_profile_from_session(
             ),
         )
 
+    source_browser_type = browser_session.browser_type.value if browser_session.browser_type else None
+
     try:
         profile = await app.DATABASE.browser_sessions.create_browser_profile(
             organization_id=organization_id,
             name=name,
             description=description,
+            source_browser_type=source_browser_type,
         )
     except IntegrityError as exc:
         _handle_duplicate_profile_name(organization_id=organization_id, name=name, exc=exc)

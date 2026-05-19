@@ -6,22 +6,23 @@ set -e
 VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://localhost:8000/api/v1}"
 VITE_WSS_BASE_URL="${VITE_WSS_BASE_URL:-ws://localhost:8000/api/v1}"
 VITE_ARTIFACT_API_BASE_URL="${VITE_ARTIFACT_API_BASE_URL:-http://localhost:9090}"
+VITE_BROWSER_STREAMING_MODE="${VITE_BROWSER_STREAMING_MODE:-vnc}"
 
 # Priority for VITE_SKYVERN_API_KEY:
-# 1. Environment variable (from .env file or docker-compose environment)
-# 2. Fallback to .streamlit/secrets.toml
-if [ -n "$VITE_SKYVERN_API_KEY" ]; then
-    # Trim whitespace and validate
+# 1. Environment variable (from .env file or docker-compose environment),
+#    but only if it looks like a real key (not a placeholder)
+# 2. Generated credentials file from the backend first-run setup
+SKYVERN_CREDENTIALS_FILE="${SKYVERN_CREDENTIALS_FILE:-/app/.skyvern/credentials.toml}"
+GENERATED_KEY=$(sed -n 's/.*cred\s*=\s*"\([^"]*\)".*/\1/p' "$SKYVERN_CREDENTIALS_FILE" 2>/dev/null || echo "")
+if [ -n "$VITE_SKYVERN_API_KEY" ] && [ "$VITE_SKYVERN_API_KEY" != "YOUR_API_KEY" ]; then
     VITE_SKYVERN_API_KEY=$(echo "$VITE_SKYVERN_API_KEY" | xargs)
     echo "Using VITE_SKYVERN_API_KEY from environment variable"
+elif [ -n "$GENERATED_KEY" ]; then
+    VITE_SKYVERN_API_KEY="$GENERATED_KEY"
+    echo "Using VITE_SKYVERN_API_KEY from $SKYVERN_CREDENTIALS_FILE"
 else
-    # Fallback: Extract API key from secrets file
-    VITE_SKYVERN_API_KEY=$(sed -n 's/.*cred\s*=\s*"\([^"]*\)".*/\1/p' .streamlit/secrets.toml 2>/dev/null || echo "")
-    if [ -n "$VITE_SKYVERN_API_KEY" ]; then
-        echo "Using VITE_SKYVERN_API_KEY from .streamlit/secrets.toml"
-    else
-        echo "WARNING: No VITE_SKYVERN_API_KEY found in environment or .streamlit/secrets.toml"
-    fi
+    echo "WARNING: No VITE_SKYVERN_API_KEY found in environment or $SKYVERN_CREDENTIALS_FILE"
+    VITE_SKYVERN_API_KEY=""
 fi
 
 # Inject environment variables into pre-built JS files (replace placeholders)
@@ -31,6 +32,7 @@ find /app/dist -name "*.js" -exec sed -i \
     -e "s|__VITE_WSS_BASE_URL_PLACEHOLDER__|${VITE_WSS_BASE_URL}|g" \
     -e "s|__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__|${VITE_ARTIFACT_API_BASE_URL}|g" \
     -e "s|__SKYVERN_API_KEY_PLACEHOLDER__|${VITE_SKYVERN_API_KEY}|g" \
+    -e "s|__VITE_BROWSER_STREAMING_MODE_PLACEHOLDER__|${VITE_BROWSER_STREAMING_MODE}|g" \
     {} \;
 
 # Start the servers (no rebuild needed)
@@ -38,4 +40,3 @@ find /app/dist -name "*.js" -exec sed -i \
 node localServer.js &
 node artifactServer.js &
 wait
-

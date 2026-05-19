@@ -28,8 +28,14 @@ export interface WorkflowCopilotChatRequest {
   workflow_id: string;
   workflow_copilot_chat_id?: string | null;
   workflow_run_id?: string | null;
+  browser_session_id?: string | null;
   message: string;
   workflow_yaml: string;
+  cancel_token?: string;
+}
+
+export interface WorkflowCopilotCancelRequest {
+  cancel_token: string;
 }
 
 export interface WorkflowCopilotChatHistoryMessage {
@@ -50,10 +56,20 @@ export interface WorkflowCopilotClearProposedWorkflowRequest {
   auto_accept: boolean;
 }
 
+export interface WorkflowCopilotApplyProposedWorkflowRequest {
+  workflow_copilot_chat_id: string;
+  auto_accept: boolean;
+}
+
 export type WorkflowCopilotStreamMessageType =
   | "processing_update"
   | "response"
-  | "error";
+  | "error"
+  | "tool_call"
+  | "tool_result"
+  | "condensing"
+  | "narration"
+  | "block_progress";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -67,11 +83,55 @@ export interface WorkflowCopilotStreamResponseUpdate {
   message: string;
   updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
+  // Clients must NOT auto-apply when true; render Accept/Reject explicitly.
+  unvalidated?: boolean;
+  // Same auto-apply guard as unvalidated; cancel forces explicit review.
+  cancelled?: boolean;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {
   type: "error";
   error: string;
+}
+
+export interface WorkflowCopilotToolCallUpdate {
+  type: "tool_call";
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  iteration: number;
+  tool_call_id: string;
+}
+
+export interface WorkflowCopilotToolResultUpdate {
+  type: "tool_result";
+  tool_name: string;
+  success: boolean;
+  summary: string;
+  iteration: number;
+  tool_call_id: string;
+  detail?: string | null;
+}
+
+export interface WorkflowCopilotCondensingUpdate {
+  type: "condensing";
+  status: "started" | "completed";
+}
+
+export interface WorkflowCopilotNarrationUpdate {
+  type: "narration";
+  narration: string;
+  iteration: number;
+  timestamp: string;
+}
+
+export interface WorkflowCopilotBlockProgressUpdate {
+  type: "block_progress";
+  workflow_run_block_id: string;
+  block_label: string;
+  block_type: string;
+  status: string;
+  iteration: number;
+  timestamp: string;
 }
 
 export interface WorkflowYAMLConversionRequest {

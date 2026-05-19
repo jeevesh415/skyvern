@@ -151,7 +151,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Loop Block",
-    description: "Repeat blocks for each item",
+    description: "Iterate over a list or while a condition stays true",
   },
   {
     nodeType: "codeBlock",
@@ -272,6 +272,28 @@ const nodeLibraryItems: Array<{
     ),
     title: "Workflow Trigger Block",
     description: "Trigger another workflow",
+  },
+  {
+    nodeType: "googleSheetsRead",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.GoogleSheetsRead}
+        className="size-6"
+      />
+    ),
+    title: "Google Sheets Read",
+    description: "Read data from a Google Sheet",
+  },
+  {
+    nodeType: "googleSheetsWrite",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.GoogleSheetsWrite}
+        className="size-6"
+      />
+    ),
+    title: "Google Sheets Write",
+    description: "Write data to a Google Sheet",
   },
 ];
 

@@ -1,4 +1,4 @@
-import { ReloadIcon, StopIcon } from "@radix-ui/react-icons";
+import { BookmarkIcon, ReloadIcon, StopIcon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 import { Outlet, useLocation, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -21,6 +21,8 @@ import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Toaster } from "@/components/ui/toaster";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useCloseBrowserSessionMutation } from "@/routes/browserSessions/hooks/useCloseBrowserSessionMutation";
+import { SaveSessionAsBrowserProfileDialog } from "@/routes/browserProfiles/SaveSessionAsBrowserProfileDialog";
+import { useBackgroundBrowserProfileCreate } from "@/routes/browserProfiles/hooks/useBackgroundBrowserProfileCreate";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
 import { browserStreamingMode } from "@/util/env";
@@ -28,10 +30,11 @@ import { browserStreamingMode } from "@/util/env";
 import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 import { BrowserSessionStream } from "./BrowserSessionStream";
+import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
 
 const isCdpMode = browserStreamingMode === "cdp";
 
-type TabName = "stream" | "recordings" | "downloads";
+type TabName = "stream" | "recordings" | "downloads" | "runs";
 
 function BrowserSession() {
   const { browserSessionId } = useParams();
@@ -40,8 +43,11 @@ function BrowserSession() {
     ? "recordings"
     : location.pathname.endsWith("/downloads")
       ? "downloads"
-      : "stream";
+      : location.pathname.endsWith("/runs")
+        ? "runs"
+        : "stream";
   const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [isSaveProfileDialogOpen, setIsSaveProfileDialogOpen] = useState(false);
   const [vncFailed, setVncFailed] = useState(false);
 
   useEffect(() => {
@@ -49,6 +55,7 @@ function BrowserSession() {
   }, [browserSessionId]);
 
   const credentialGetter = useCredentialGetter();
+  const { startBackgroundCreate } = useBackgroundBrowserProfileCreate();
 
   const query = useQuery({
     queryKey: ["browserSession", browserSessionId],
@@ -148,44 +155,54 @@ function BrowserSession() {
               { label: "Stream", to: "stream" },
               { label: "Recordings", to: "recordings" },
               { label: "Downloads", to: "downloads" },
+              { label: "Runs", to: "runs" },
             ]}
           />
 
           {browserSessionId && browserSession?.status === "running" && (
-            <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-              <DialogTrigger asChild>
-                <Button className="ml-auto" variant="secondary">
-                  <StopIcon className="mr-2 h-4 w-4" />
-                  Stop
-                </Button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Are you sure?</DialogTitle>
-                  <DialogDescription>
-                    Are you sure you want to stop (shut down) this browser
-                    session?
-                  </DialogDescription>
-                </DialogHeader>
-                <DialogFooter>
-                  <DialogClose asChild>
-                    <Button variant="secondary">Back</Button>
-                  </DialogClose>
-                  <Button
-                    variant="destructive"
-                    onClick={() => {
-                      closeBrowserSessionMutation.mutate();
-                    }}
-                    disabled={closeBrowserSessionMutation.isPending}
-                  >
-                    {closeBrowserSessionMutation.isPending && (
-                      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                    )}
-                    Stop Browser Session
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                variant="default"
+                onClick={() => setIsSaveProfileDialogOpen(true)}
+              >
+                <BookmarkIcon className="mr-2 h-4 w-4" />
+                Save Profile
+              </Button>
+              <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+                <DialogTrigger asChild>
+                  <Button variant="ghost">
+                    <StopIcon className="mr-2 h-4 w-4" />
+                    Stop
                   </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Are you sure?</DialogTitle>
+                    <DialogDescription>
+                      Are you sure you want to stop (shut down) this browser
+                      session?
+                    </DialogDescription>
+                  </DialogHeader>
+                  <DialogFooter>
+                    <DialogClose asChild>
+                      <Button variant="secondary">Back</Button>
+                    </DialogClose>
+                    <Button
+                      variant="destructive"
+                      onClick={() => {
+                        closeBrowserSessionMutation.mutate();
+                      }}
+                      disabled={closeBrowserSessionMutation.isPending}
+                    >
+                      {closeBrowserSessionMutation.isPending && (
+                        <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                      )}
+                      Stop Browser Session
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+            </div>
           )}
         </div>
 
@@ -236,10 +253,28 @@ function BrowserSession() {
           >
             <BrowserSessionDownloads />
           </div>
+          <div
+            className="absolute left-0 top-0 h-full w-full overflow-auto p-1"
+            style={{
+              visibility: activeTab === "runs" ? "visible" : "hidden",
+              pointerEvents: activeTab === "runs" ? "auto" : "none",
+            }}
+          >
+            <BrowserSessionWorkflowRuns />
+          </div>
         </div>
       </div>
       <Outlet />
       <Toaster />
+      {browserSessionId && (
+        <SaveSessionAsBrowserProfileDialog
+          browserSessionId={browserSessionId}
+          isSessionRunning={browserSession?.status === "running"}
+          onStartBackgroundCreate={startBackgroundCreate}
+          open={isSaveProfileDialogOpen}
+          onOpenChange={setIsSaveProfileDialogOpen}
+        />
+      )}
     </div>
   );
 }

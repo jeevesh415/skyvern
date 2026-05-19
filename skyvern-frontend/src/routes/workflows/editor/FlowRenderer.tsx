@@ -72,6 +72,7 @@ import {
   nodeTypes,
   WorkflowBlockNode,
 } from "./nodes";
+import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -387,6 +388,8 @@ function FlowRenderer({
       nextLocation.pathname !== currentLocation.pathname
     );
   });
+  const blockerRef = useRef(blocker);
+  blockerRef.current = blocker;
 
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
@@ -663,7 +666,7 @@ function FlowRenderer({
       workflowChangesStore.setHasChanges(true);
       postHog.capture("builder.block.removed", {
         org_id: workflow.organization_id,
-        block_type: node.type,
+        block_type: blockTypeFromNode(node) ?? node.type,
       });
 
       doLayout(newNodesWithUpdatedParameters, newEdges);
@@ -952,7 +955,10 @@ function FlowRenderer({
         open={blocker.state === "blocked"}
         onOpenChange={(open) => {
           if (!open) {
-            blocker.reset?.();
+            const current = blockerRef.current;
+            if (current.state === "blocked") {
+              current.reset?.();
+            }
           }
         }}
       >
@@ -968,7 +974,10 @@ function FlowRenderer({
             <Button
               variant="secondary"
               onClick={() => {
-                blocker.proceed?.();
+                const current = blockerRef.current;
+                if (current.state === "blocked") {
+                  current.proceed?.();
+                }
               }}
             >
               Continue without saving
@@ -976,8 +985,9 @@ function FlowRenderer({
             <Button
               onClick={() => {
                 handleSave().then((ok) => {
-                  if (ok) {
-                    blocker.proceed?.();
+                  const current = blockerRef.current;
+                  if (ok && current.state === "blocked") {
+                    current.proceed?.();
                   }
                 });
               }}

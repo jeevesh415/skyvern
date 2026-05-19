@@ -3,6 +3,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.context import ResponseType
+
 
 class WorkflowCopilotChat(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -38,13 +40,36 @@ class WorkflowCopilotChatRequest(BaseModel):
     workflow_id: str = Field(..., description="Workflow ID (mutable version ID)")
     workflow_copilot_chat_id: str | None = Field(None, description="The chat ID to send the message to")
     workflow_run_id: str | None = Field(None, description="The workflow run ID to use for the context")
+    browser_session_id: str | None = Field(
+        None,
+        description="Optional persistent browser session ID to reuse instead of creating a new one.",
+    )
     message: str = Field(..., description="The message that user sends")
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
+    cancel_token: str | None = Field(
+        None,
+        description=(
+            "Client-generated UUID. POST it to /workflow/copilot/cancel to hard-cancel this turn. "
+            "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
+        ),
+    )
+
+
+class WorkflowCopilotCancelRequest(BaseModel):
+    cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="The chat ID to update")
     auto_accept: bool = Field(..., description="Whether to auto-accept future workflow updates")
+
+
+class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="The chat whose proposed workflow should be applied")
+    auto_accept: bool = Field(
+        False,
+        description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
+    )
 
 
 class WorkflowCopilotChatHistoryMessage(BaseModel):
@@ -67,6 +92,8 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     CONDENSING = "condensing"
+    NARRATION = "narration"
+    BLOCK_PROGRESS = "block_progress"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -85,6 +112,19 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     message: str = Field(..., description="The message sent to the user")
     updated_workflow: dict | None = Field(None, description="The updated workflow")
     response_time: datetime = Field(..., description="When the assistant message was created")
+    total_tokens: int | None = Field(
+        None,
+        description="Total tokens consumed by the agent during this turn; None when no provider reported usage",
+    )
+    response_type: ResponseType = Field("REPLY", description="Agent response classification")
+    unvalidated: bool = Field(
+        False,
+        description="When true, clients must not auto-apply; render Accept/Reject explicitly.",
+    )
+    cancelled: bool = Field(
+        False,
+        description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
+    )
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):
@@ -111,6 +151,13 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
     summary: str = Field(..., description="Brief human-readable summary of the result")
     iteration: int = Field(..., description="Agent loop iteration number")
     tool_call_id: str = Field(..., description="Unique ID for this tool invocation")
+    detail: str | None = Field(
+        None,
+        description=(
+            "Longer-cap sanitized failure text for tooltip display. None on success. "
+            "Distinct from `summary`, which is capped tighter for the visible bullet."
+        ),
+    )
 
 
 class WorkflowCopilotCondensingUpdate(BaseModel):
@@ -118,6 +165,35 @@ class WorkflowCopilotCondensingUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.CONDENSING, description="Message type"
     )
     status: str = Field(..., description="Condensing status: 'started' or 'completed'")
+
+
+class WorkflowCopilotNarrationUpdate(BaseModel):
+    # Ephemeral, user-facing one-sentence status line emitted periodically while
+    # the agent runs. Distinct from PROCESSING_UPDATE (terse status text) so the
+    # frontend can style narration as a separate "thinking" channel. Not
+    # persisted to chat history -- reload shows only user and final-assistant
+    # rows.
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.NARRATION, description="Message type"
+    )
+    narration: str = Field(..., description="One-sentence user-facing progress narration")
+    iteration: int = Field(..., description="Agent loop iteration number this narration describes")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotBlockProgressUpdate(BaseModel):
+    # Per-block lifecycle event from inside long-running tool calls.
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.BLOCK_PROGRESS, description="Message type"
+    )
+    workflow_run_block_id: str = Field(..., description="Stable per-block id; used as the row key in the activity pane")
+    block_label: str = Field(..., description="Workflow block label (e.g. 'enter_name')")
+    block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
+    status: str = Field(
+        ..., description="BlockStatus value: running, completed, failed, terminated, timed_out, canceled, skipped"
+    )
+    iteration: int = Field(..., description="Agent loop iteration number this block belongs to")
+    timestamp: datetime = Field(..., description="Server timestamp")
 
 
 class WorkflowYAMLConversionRequest(BaseModel):

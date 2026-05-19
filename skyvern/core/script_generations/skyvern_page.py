@@ -306,6 +306,7 @@ class SkyvernPage(Page):
         prompt: str | None = None,
         ai: str | None = "fallback",
         mode: str | None = None,
+        recoverable_marker_id: int | None = None,
         **kwargs: Any,
     ) -> str | None:
         """Click an element using a CSS selector, AI-powered prompt matching, or both.
@@ -410,6 +411,7 @@ class SkyvernPage(Page):
                     timeout=timeout,
                     failed_selector=original_selector or "",
                     block_label=self.current_label,
+                    recoverable_marker_id=recoverable_marker_id,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -422,6 +424,8 @@ class SkyvernPage(Page):
                     intention=prompt,
                     data=data,
                     timeout=timeout,
+                    block_label=self.current_label,
+                    recoverable_marker_id=recoverable_marker_id,
                 )
 
         if selector:
@@ -490,6 +494,7 @@ class SkyvernPage(Page):
         mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        recoverable_marker_id: int | None = None,
         **kwargs: Any,
     ) -> str:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
@@ -572,24 +577,26 @@ class SkyvernPage(Page):
 
         return await self._input_text(
             selector=selector,
-            value=value or "",
+            value=value if value is not None else "",
             ai=ai,
             intention=prompt,
             data=data,
             timeout=timeout,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
+            recoverable_marker_id=recoverable_marker_id,
         )
 
     @action_wrap(ActionType.INPUT_TEXT)
     async def type(
         self,
-        selector: str | None,
-        value: str,
+        selector: str | None = None,
+        value: str | None = None,
         ai: str | None = "fallback",
         prompt: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        recoverable_marker_id: int | None = None,
         **kwargs: Any,
     ) -> str:
         # Backward compatibility
@@ -605,13 +612,14 @@ class SkyvernPage(Page):
 
         return await self._input_text(
             selector=selector,
-            value=value,
+            value=value if value is not None else "",
             ai=ai,
             intention=prompt,
             data=data,
             timeout=timeout,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
+            recoverable_marker_id=recoverable_marker_id,
         )
 
     @action_wrap(ActionType.INPUT_TEXT)
@@ -921,6 +929,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        recoverable_marker_id: int | None = None,
     ) -> str:
         """Input text into an element identified by ``selector``.
 
@@ -984,6 +993,7 @@ class SkyvernPage(Page):
                     timeout=timeout,
                     failed_selector=original_selector or "",
                     block_label=self.current_label,
+                    recoverable_marker_id=recoverable_marker_id,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -998,6 +1008,8 @@ class SkyvernPage(Page):
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
                 timeout=timeout,
+                block_label=self.current_label,
+                recoverable_marker_id=recoverable_marker_id,
             )
 
         if not selector:
@@ -1323,6 +1335,9 @@ class SkyvernPage(Page):
         """
         data = kwargs.pop("data", None)
         skip_refresh = kwargs.pop("skip_refresh", False)
+        extra_kwargs: dict[str, Any] = {}
+        if "system_prompt" in kwargs:
+            extra_kwargs["system_prompt"] = kwargs.pop("system_prompt")
         return await self._ai.ai_extract(
             prompt=prompt,
             schema=schema,
@@ -1330,6 +1345,7 @@ class SkyvernPage(Page):
             intention=intention,
             data=data,
             skip_refresh=skip_refresh,
+            **extra_kwargs,
         )
 
     async def validate(
@@ -1968,11 +1984,19 @@ class SkyvernPage(Page):
         if not form_fields:
             raise RuntimeError(
                 "fill_form found 0 form fields on the page. "
-                "The page may not have finished rendering — try adding "
+                "The page may not have finished rendering - try adding "
                 "await page.wait(timeout_ms=5000) before fill_form()."
             )
 
         mapping = await self.dynamic_field_map(form_fields, data, prompt=prompt)
+
+        if data and not mapping:
+            raise RuntimeError(
+                f"fill_form mapped 0 of {len(form_fields)} form fields despite "
+                f"{len(data)} data keys provided. The field labels may not match the data keys, "
+                "or the form may not have finished rendering - try adding "
+                "await page.wait(timeout_ms=5000) before fill_form()."
+            )
 
         if not await self.validate_mapping(form_fields, mapping, prompt):
             raise ScriptTerminationException("fill_form validation failed: user termination conditions not met")
@@ -2022,6 +2046,7 @@ class SkyvernPage(Page):
         start_time = time.monotonic()
         pages_filled = 0
         prev_field_signature: str | None = None
+        prev_unmapped_optional_page = False
         consecutive_validation_failures = 0
 
         for page_num in range(max_pages):
@@ -2062,6 +2087,11 @@ class SkyvernPage(Page):
             # next-button click didn't navigate. Stop to avoid infinite loop.
             field_sig = "|".join((f.get("label") or f.get("name") or f.get("placeholder") or "") for f in fillable)
             if field_sig and field_sig == prev_field_signature:
+                if prev_unmapped_optional_page:
+                    raise RuntimeError(
+                        f"fill_multipage_form mapped 0 form fields on the previous optional page despite "
+                        f"{len(data)} data keys provided, and the next click did not advance to a new page."
+                    )
                 LOG.warning(
                     "fill_multipage_form: same fields detected, page did not advance — stopping",
                     page_num=page_num,
@@ -2089,6 +2119,24 @@ class SkyvernPage(Page):
             await self._dump_html(debug_dir, f"p{page_num}_00_before_fill")
 
             mapping = await self.dynamic_field_map(form_fields, data, prompt=prompt)
+
+            required_fillable = [f for f in fillable if f.get("required")]
+            has_file_field = any(f.get("type") == "file" for f in fillable)
+            unmapped_optional_page = bool(data and not mapping and not required_fillable and not has_file_field)
+            if data and not mapping and required_fillable:
+                raise RuntimeError(
+                    f"fill_multipage_form mapped 0 of {len(form_fields)} form fields on page {page_num} despite "
+                    f"{len(data)} data keys provided. The field labels may not match the data keys, "
+                    "or the form may not have finished rendering - try adding "
+                    "await page.wait(timeout_ms=5000) before fill_multipage_form()."
+                )
+            if unmapped_optional_page:
+                LOG.info(
+                    "fill_multipage_form: no fields mapped on optional page, continuing",
+                    page_num=page_num,
+                    field_count=len(form_fields),
+                    data_key_count=len(data),
+                )
 
             # Skip validation on intermediate pages — validate_mapping checks user
             # instructions like "do not submit" which only apply to the final page.
@@ -2124,12 +2172,14 @@ class SkyvernPage(Page):
                 if new_mapping:
                     await self.fill_from_mapping(rescan_fields, new_mapping, data=data)
                     await self._dump_html(debug_dir, f"p{page_num}_02_after_rescan_fill")
+                    unmapped_optional_page = False
                 # Update field signature to use the new fields for stuck detection
                 fillable = rescan_fillable
                 form_fields = rescan_fields
                 prev_field_signature = "|".join(
                     (f.get("label") or f.get("name") or f.get("placeholder") or "") for f in fillable
                 )
+            prev_unmapped_optional_page = unmapped_optional_page
 
             # Try to click the next/continue button
             try:
@@ -2143,6 +2193,11 @@ class SkyvernPage(Page):
                     "fill_multipage_form: next button not found, stopping",
                     page_num=page_num,
                 )
+                if unmapped_optional_page:
+                    raise RuntimeError(
+                        f"fill_multipage_form mapped 0 of {len(form_fields)} form fields on page {page_num} "
+                        f"despite {len(data)} data keys provided, and could not advance to another page."
+                    )
                 break
 
             await self._dump_html(debug_dir, f"p{page_num}_03_after_click_next")
@@ -3213,7 +3268,8 @@ class SkyvernPage(Page):
     async def element_fallback(
         self,
         navigation_goal: str,
-        max_steps: int = 10,
+        max_steps: int = 5,
+        validate_first: bool = False,
     ) -> None:
         """Activate the AI agent from the CURRENT page position to achieve a goal.
 
@@ -3223,7 +3279,12 @@ class SkyvernPage(Page):
 
         Args:
             navigation_goal: The goal for the AI agent to achieve from the current page.
-            max_steps: Maximum number of agent steps before giving up. Defaults to 10.
+            max_steps: Maximum number of agent steps before giving up. Defaults to 5.
+            validate_first: When True, run an AI validation before the first
+                action to short-circuit if the page already satisfies the goal.
+                Defaults to False because the documented call site (else branch
+                of ``classify``) cannot be on the success state — pass True for
+                defensive calls that may invoke this on a possibly-complete page.
 
         Raises:
             Exception: If the element fallback fails or exceeds max_steps.
@@ -3244,6 +3305,7 @@ class SkyvernPage(Page):
         return await self._ai.ai_element_fallback(
             navigation_goal=navigation_goal,
             max_steps=max_steps,
+            validate_first=validate_first,
         )
 
     async def prompt(
@@ -3512,6 +3574,16 @@ class RunContext:
         if ctx and ctx.loop_metadata:
             return ctx.loop_metadata.get("current_value")
         return None
+
+    def credential_totp_identifier(self, credential_key: str) -> str | None:
+        """Look up the TOTP identifier registered for a workflow credential parameter."""
+        ctx = skyvern_context.current()
+        if not ctx or not ctx.workflow_run_id:
+            return None
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(ctx.workflow_run_id)
+        if workflow_run_context is None:
+            return None
+        return workflow_run_context.credential_totp_identifiers.get(credential_key)
 
     def loop_item_selector(self) -> str | None:
         """Build a CSS selector to click the current loop item's link on the page.

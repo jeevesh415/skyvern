@@ -13,7 +13,9 @@ keywords:
   - JSON
 ---
 
-Parameters let you create reusable workflows that accept different input values each time they run. Instead of hardcoding a URL or search term into a block, reference a parameter and fill in the value when you run the workflow.
+Parameters let you create reusable workflows that accept different input values each time they run. Instead of hardcoding a URL or search term into a block, you reference a parameter and fill in the value when you run the workflow.
+
+This page covers parameters in the Cloud UI workflow editor. If you're building automations in code, parameters are just function arguments. See [Browser Automation](/developers/browser-automations/overview) for the code-first approach.
 
 ---
 
@@ -129,7 +131,7 @@ These variable names are built-in and cannot be used as parameter keys:
 |----------|-------------|-------------|
 | `current_value` | Loop blocks | The current item being iterated |
 | `current_item` | Loop blocks | Alias for `current_value` |
-| `current_index` | Loop blocks | Zero-based index of the current iteration |
+| `current_index` | Loop and While Loop blocks | Zero-based index of the current iteration |
 | `workflow_run_id` | All blocks | Unique ID of the current run |
 | `workflow_id` | All blocks | The workflow's ID |
 | `workflow_permanent_id` | All blocks | The workflow's permanent ID |

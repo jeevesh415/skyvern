@@ -768,6 +768,27 @@ await skyvern.createCredential({
     }
 });
 """
+UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+updated = await skyvern.update_credential(
+    credential_id="cred_123",
+    name="My Credential",
+    credential_type="password",
+    credential={"username": "user@example.com", "password": "newpassword123"},
+)
+print(updated)
+"""
+UPDATE_CREDENTIAL_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const updated = await skyvern.updateCredential("cred_123", {
+    name: "My Credential",
+    credential_type: "password",
+    credential: { username: "user@example.com", password: "newpassword123" }
+});
+console.log(updated);
+"""
 DELETE_CREDENTIAL_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
@@ -922,4 +943,23 @@ DELETE_BROWSER_PROFILE_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyve
 
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await skyvern.browserProfiles.deleteBrowserProfile("bp_123");
+"""
+UPDATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+browser_profile = await skyvern.browser_profiles.update_browser_profile(
+    "bp_123",
+    name="Renamed Profile",
+    description="Updated description",
+)
+print(browser_profile)
+"""
+UPDATE_BROWSER_PROFILE_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const browserProfile = await skyvern.browserProfiles.updateBrowserProfile("bp_123", {
+    name: "Renamed Profile",
+    description: "Updated description",
+});
+console.log(browserProfile);
 """

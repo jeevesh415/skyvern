@@ -1,4 +1,5 @@
 import { ClickIcon } from "@/components/icons/ClickIcon";
+import { GoogleSheetsIcon } from "@/components/icons/GoogleSheetsIcon";
 import { WorkflowBlockType } from "../../types/workflowTypes";
 import {
   CheckCircledIcon,
@@ -49,7 +50,8 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "file_url_parser": {
       return <CursorTextIcon className={className} />;
     }
-    case "for_loop": {
+    case "for_loop":
+    case "while_loop": {
       return <UpdateIcon className={className} />;
     }
     case "login": {
@@ -97,6 +99,12 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "workflow_trigger": {
       return <Share1Icon className={className} />;
+    }
+    case "google_sheets_read": {
+      return <GoogleSheetsIcon className={className} />;
+    }
+    case "google_sheets_write": {
+      return <GoogleSheetsIcon className={className} />;
     }
   }
 }

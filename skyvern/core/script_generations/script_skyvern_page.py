@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import re
 from pathlib import Path
 from typing import Any, Callable
 
+import pydantic
 import pyotp
 import structlog
 from cachetools import TTLCache
@@ -17,7 +19,7 @@ from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ActionCall, ActionMetadata, RunContext, SkyvernPage
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import ScriptTerminationException, WorkflowRunNotFound
+from skyvern.exceptions import IllegitCompleteScriptTermination, ScriptTerminationException, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -27,6 +29,7 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
@@ -177,22 +180,6 @@ class ScriptSkyvernPage(SkyvernPage):
         and screenshot artifacts after action execution.
         """
 
-        # Emoji mapping for different action types
-        ACTION_EMOJIS = {
-            ActionType.CLICK: "👆",
-            ActionType.INPUT_TEXT: "⌨️",
-            ActionType.UPLOAD_FILE: "📤",
-            ActionType.DOWNLOAD_FILE: "📥",
-            ActionType.HOVER: "🖱️",
-            ActionType.SELECT_OPTION: "🎯",
-            ActionType.WAIT: "⏳",
-            ActionType.SOLVE_CAPTCHA: "🔓",
-            ActionType.VERIFICATION_CODE: "🔐",
-            ActionType.SCROLL: "📜",
-            ActionType.COMPLETE: "✅",
-            ActionType.TERMINATE: "🛑",
-        }
-
         prompt = kwargs.get("prompt", "")
 
         # Backward compatibility: use intention if provided and prompt is empty
@@ -206,16 +193,10 @@ class ScriptSkyvernPage(SkyvernPage):
 
         action_status = ActionStatus.completed
 
-        # Print action in script mode
         context = skyvern_context.current()
         if context and context.script_mode:
-            emoji = ACTION_EMOJIS.get(action, "🔧")
             action_name = action.value if hasattr(action, "value") else str(action)
-            print(f"{emoji} {action_name.replace('_', ' ').title()}", end="")
-            if prompt:
-                print(f": {prompt}")
-            else:
-                print()
+            LOG.debug("Script action", action=action_name, prompt=prompt)
 
         # Download detection for click actions
         download_triggered: bool | None = None
@@ -253,9 +234,8 @@ class ScriptSkyvernPage(SkyvernPage):
 
             # Note: Action status would be updated to completed here if update method existed
 
-            # Print success in script mode
             if context and context.script_mode:
-                print("  ✓ Completed")
+                LOG.debug("Action completed")
 
             return call.result
         except Exception as e:
@@ -324,13 +304,22 @@ class ScriptSkyvernPage(SkyvernPage):
                     pass  # Don't block if download detection fails
 
             self._record(call)
-            # Ensure selector is in kwargs for action recording (it may be a positional arg).
-            # Copy kwargs to avoid mutating the caller's dict.
+            # Bind positional args to parameter names so subclass-specific fields
+            # (e.g. MoveAction.x/y, ScrollAction.scroll_x/scroll_y) are accessible
+            # by name in _create_action_and_result_after_execution. Copy to avoid
+            # mutating the caller's dict.
             recording_kwargs = dict(kwargs)
-            if "selector" not in recording_kwargs and args:
-                first_arg = args[0]
-                if isinstance(first_arg, str):
-                    recording_kwargs["selector"] = first_arg
+            try:
+                bound = inspect.signature(fn).bind_partial(self, *args, **kwargs)
+                for name, value in bound.arguments.items():
+                    if name in ("self", "kwargs"):
+                        continue
+                    recording_kwargs.setdefault(name, value)
+            except TypeError:
+                if "selector" not in recording_kwargs and args:
+                    first_arg = args[0]
+                    if isinstance(first_arg, str):
+                        recording_kwargs["selector"] = first_arg
             # Auto-create action after execution and store result
             await self._create_action_and_result_after_execution(
                 action_type=action,
@@ -452,7 +441,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 elif action_type == ActionType.UPLOAD_FILE:
                     file_url = str(call_result)
 
-            action = Action(
+            common_fields: dict[str, Any] = dict(
                 element_id="",
                 action_type=action_type,
                 status=status,
@@ -473,28 +462,41 @@ class ScriptSkyvernPage(SkyvernPage):
                 downloaded_files=downloaded_files,
                 created_by="script",
             )
-            data_extraction_goal = None
-            data_extraction_schema = None
+            data_extraction_goal: str | None = None
+            data_extraction_schema: dict[str, Any] | list | str | None = None
             if action_type == ActionType.EXTRACT:
+                # ExtractAction is special-cased because the script kwargs use
+                # `prompt`/`schema` while the subclass fields are
+                # `data_extraction_goal`/`data_extraction_schema`.
                 data_extraction_goal = kwargs.get("prompt")
                 data_extraction_schema = kwargs.get("schema")
-                action = ExtractAction(
-                    element_id="",
-                    action_type=action_type,
-                    status=status,
-                    organization_id=context.organization_id,
-                    workflow_run_id=context.workflow_run_id,
-                    task_id=context.task_id,
-                    step_id=context.step_id,
-                    step_order=0,
-                    action_order=context.action_order,
-                    intention=intention,
+                action: Action = ExtractAction(
+                    **common_fields,
                     data_extraction_goal=data_extraction_goal,
                     data_extraction_schema=data_extraction_schema,
-                    option=select_option,
-                    response=response,
-                    created_by="script",
                 )
+            else:
+                subclass = ACTION_TYPE_TO_CLASS.get(action_type, Action)
+                subclass_extra_fields = {
+                    name: kwargs[name] for name in subclass.model_fields if name in kwargs and name not in common_fields
+                }
+                # Drop None values so subclasses with stricter types (e.g.
+                # ClickAction.download: bool = False) can fall back to their
+                # defaults instead of raising ValidationError on None.
+                subclass_fields = {
+                    **{k: v for k, v in common_fields.items() if v is not None},
+                    **subclass_extra_fields,
+                }
+                try:
+                    action = subclass(**subclass_fields)
+                except pydantic.ValidationError as exc:
+                    LOG.warning(
+                        "Failed to instantiate action subclass, falling back to base Action",
+                        action_type=action_type,
+                        subclass=subclass.__name__,
+                        errors=exc.errors(),
+                    )
+                    action = Action(**common_fields)
 
             created_action = await app.DATABASE.workflow_params.create_action(action)
             # Skip LLM reasoning in script mode — use static string instead.
@@ -941,7 +943,7 @@ class ScriptSkyvernPage(SkyvernPage):
         context = skyvern_context.current()
         is_script_mode = context and context.script_mode
         if is_script_mode:
-            print(f"🌐 Navigating to: {url}")
+            LOG.debug("Navigating to URL", url=url)
 
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         max_retries = kwargs.pop("max_retries", NAVIGATION_MAX_RETRY_TIME)
@@ -952,7 +954,7 @@ class ScriptSkyvernPage(SkyvernPage):
             try:
                 await self.page.goto(url, timeout=timeout, **kwargs)
                 if is_script_mode:
-                    print("  ✓ Page loaded")
+                    LOG.debug("Page loaded")
                 return
             except Exception as e:
                 last_error = e
@@ -1012,7 +1014,7 @@ class ScriptSkyvernPage(SkyvernPage):
             return
         if context.skip_complete_verification:
             if context.script_mode:
-                print("  ⏭ Skipping complete() verification (--no-verify)")
+                LOG.debug("Skipping complete() verification (--no-verify)")
             return
 
         # In script mode, add a settle delay before verification. Scripts execute
@@ -1051,7 +1053,9 @@ class ScriptSkyvernPage(SkyvernPage):
             # result = await ActionHandler.handle_action(self.scraped_page, task, step, self.page, action)
             result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
-                raise ScriptTerminationException(result[-1].exception_message)
+                # Coerce empty/None messages so downstream str(e) is meaningful.
+                msg = result[-1].exception_message or "complete-verify rejected without a message"
+                raise IllegitCompleteScriptTermination(msg)
 
         # Capture final full-page screenshot at block completion
         await self._create_final_screenshot()

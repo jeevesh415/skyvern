@@ -14,9 +14,11 @@ implicit resolver so the values stay as plain strings.
 
 import json
 
+import pytest
 import yaml
 
-from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 
 ISO_BLOB = """
 parameters:
@@ -75,3 +77,67 @@ def test_safe_load_no_dates_preserves_other_implicit_types() -> None:
     assert parsed["a_bool"] is True
     assert parsed["a_null"] is None
     assert parsed["a_list"] == [1, 2, 3]
+
+
+def test_process_workflow_yaml_keeps_json_parameter_iso_strings() -> None:
+    workflow = _process_workflow_yaml(
+        workflow_id="wf-123",
+        workflow_permanent_id="wfp-123",
+        organization_id="org-123",
+        workflow_yaml="""
+title: Test
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: payload
+      workflow_parameter_type: json
+      default_value:
+        id: "12345"
+        metadata:
+          created_at: 2023-10-27T10:00:00Z
+          updated_at: 2023-10-28T14:30:00Z
+  blocks:
+    - block_type: navigation
+      label: step1
+      url: https://example.com
+      title: Step 1
+      navigation_goal: Open the page
+""",
+    )
+
+    parameter = workflow.get_parameter("payload")
+    assert parameter is not None
+    assert parameter.default_value is not None
+
+    metadata = parameter.default_value["metadata"]
+    assert metadata["created_at"] == "2023-10-27T10:00:00Z"
+    assert metadata["updated_at"] == "2023-10-28T14:30:00Z"
+    assert isinstance(metadata["created_at"], str)
+    assert isinstance(metadata["updated_at"], str)
+
+
+def test_format_yaml_error_pins_line_and_column_for_marked_errors() -> None:
+    # Misaligned indent under "- label: first" — PyYAML reports the
+    # block-collection failure at line 4 col 4 (1-indexed), with the
+    # parent collection context at line 3 col 3.
+    bad_yaml = "title: Test\nblocks:\n  - label: first\n   bad_indent: oops\n"
+
+    with pytest.raises(yaml.YAMLError) as excinfo:
+        safe_load_no_dates(bad_yaml)
+
+    detail = format_yaml_error(excinfo.value)
+    assert detail == (
+        "Invalid YAML: expected <block end>, but found '<block mapping start>' "
+        "at line 4, column 4 "
+        "(while parsing a block collection at line 3, column 3)"
+    )
+
+
+def test_format_yaml_error_falls_back_for_plain_yaml_errors() -> None:
+    detail = format_yaml_error(yaml.YAMLError("something generic"))
+    assert detail == "Invalid YAML: something generic"
+
+
+def test_format_yaml_error_handles_blank_message() -> None:
+    detail = format_yaml_error(yaml.YAMLError(""))
+    assert detail == "Invalid YAML"

@@ -3,6 +3,7 @@ import { ReloadIcon, PlayIcon, StopIcon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useReactFlow } from "@xyflow/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
@@ -30,7 +31,10 @@ import {
   type WorkflowParameter,
   type Parameter,
 } from "@/routes/workflows/types/workflowTypes";
+import { getBlockParameterDependencies } from "@/routes/workflows/editor/debugger/getBlockParameterDependencies";
+import { findWorkflowBlockByLabel } from "@/routes/workflows/workflowBlockUtils";
 import { getInitialValues } from "@/routes/workflows/utils";
+import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -53,6 +57,16 @@ import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { workflowBlockTitle } from "../types";
 import { MicroDropdown } from "./MicroDropdown";
 import { BlockParametersDialog } from "./BlockParametersDialog";
+import type { AppNode } from "..";
+import { getWorkflowErrors } from "../../workflowEditorUtils";
+
+class ValidationFailureError extends Error {
+  readonly isValidationFailure = true;
+  constructor() {
+    super("workflow validation failed");
+    this.name = "ValidationFailureError";
+  }
+}
 
 function isWorkflowParameter(param: Parameter): param is WorkflowParameter {
   return (
@@ -214,6 +228,7 @@ function NodeHeader({
     workflowPermanentId,
   });
   const saveWorkflow = useWorkflowSave();
+  const reactFlow = useReactFlow<AppNode>();
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
@@ -314,6 +329,33 @@ function NodeHeader({
     }) => {
       closeWorkflowPanel();
 
+      // Compute errors against the full graph so per-block validators that
+      // reference siblings/edges (loops, conditionals, validation block
+      // ordering) behave correctly, then keep only the ones tagged with this
+      // block's label so unrelated unfinished nodes don't block running this
+      // one. Filter relies on the implicit contract that every validator
+      // formats errors as `${label}: ${message}` - if that ever drifts,
+      // errors for this block would silently slip past this gate.
+      const allErrors = getWorkflowErrors(reactFlow.getNodes());
+      const labelPrefix = `${blockLabel}:`;
+      const blockErrors = allErrors.filter((e) => e.startsWith(labelPrefix));
+      if (blockErrors.length > 0) {
+        toast({
+          variant: "destructive",
+          title: "Can not run block because of errors:",
+          description: (
+            <div className="space-y-2">
+              {blockErrors.map((error) => (
+                <p key={error}>{error}</p>
+              ))}
+            </div>
+          ),
+        });
+        // Throw a typed error so React Query routes to onError (not
+        // onSuccess) without firing the generic "Failed to start" toast.
+        throw new ValidationFailureError();
+      }
+
       await saveWorkflow.mutateAsync();
 
       if (!workflowPermanentId) {
@@ -355,7 +397,17 @@ function NodeHeader({
           (parameter) => parameter.parameter_type === "workflow",
         );
 
-      const parameters = getInitialValues(location, workflowParameters ?? []);
+      const lastRunValues = workflowPermanentId
+        ? useDebuggerLastRunValuesStore
+            .getState()
+            .getLastRunValues(workflowPermanentId)
+        : null;
+
+      const parameters = getInitialValues(
+        location,
+        workflowParameters ?? [],
+        lastRunValues,
+      );
 
       // Merge with parameter overrides if provided
       const mergedParameters = opts?.parameterOverrides
@@ -439,7 +491,12 @@ function NodeHeader({
         `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
       );
     },
-    onError: (error: AxiosError) => {
+    onError: (error: AxiosError | ValidationFailureError) => {
+      // The block-validation gate threw a typed error and already showed
+      // its own toast; don't stack the generic "Failed to start" on top.
+      if (error instanceof ValidationFailureError) {
+        return;
+      }
       const detail = (error.response?.data as { detail?: string })?.detail;
       log.error("Run block: error", {
         workflowPermanentId,
@@ -518,17 +575,37 @@ function NodeHeader({
       workflow?.workflow_definition?.parameters ?? []
     ).filter(isWorkflowParameter);
 
-    // If there are any workflow parameters, always prompt the user
-    // The backend requires all params to be specified for each run
     if (workflowParameters.length > 0) {
-      const currentValues = getInitialValues(location, workflowParameters);
-      setCurrentParamValues(currentValues);
-      setParametersToPrompt(workflowParameters);
-      setShowParamsDialog(true);
+      const lastRunValues = workflowPermanentId
+        ? useDebuggerLastRunValuesStore
+            .getState()
+            .getLastRunValues(workflowPermanentId)
+        : null;
+      const currentValues = getInitialValues(
+        location,
+        workflowParameters,
+        lastRunValues,
+      );
+      const block = findWorkflowBlockByLabel(blocks, blockLabel);
+      const parametersToRun = getBlockParameterDependencies(
+        block ?? undefined,
+        workflowParameters,
+      );
+
+      if (parametersToRun.length > 0) {
+        setCurrentParamValues(currentValues);
+        setParametersToPrompt(parametersToRun);
+        setShowParamsDialog(true);
+        return;
+      }
+
+      runBlock.mutate({
+        codeGen: numBlocksInWorkflow === 1,
+        parameterOverrides: currentValues,
+      });
       return;
     }
 
-    // No parameters, run directly
     runBlock.mutate({ codeGen: numBlocksInWorkflow === 1 });
   };
 
@@ -563,14 +640,14 @@ function NodeHeader({
 
       <header className="!mt-0 flex h-[2.75rem] justify-between gap-2">
         <div
-          className={cn("flex gap-2", {
+          className={cn("flex min-w-0 gap-2", {
             "opacity-50": thisBlockIsPlaying,
           })}
         >
           <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
           </div>
-          <div className="flex flex-col gap-1">
+          <div className="flex min-w-0 flex-col gap-1">
             <EditableNodeTitle
               value={blockLabel}
               editable={editable}
@@ -700,6 +777,11 @@ function NodeHeader({
             },
             {
               onSuccess: () => {
+                if (workflowPermanentId) {
+                  useDebuggerLastRunValuesStore
+                    .getState()
+                    .setLastRunValues(workflowPermanentId, values);
+                }
                 // Close dialog on success - navigation also happens in mutation's onSuccess
                 setShowParamsDialog(false);
               },

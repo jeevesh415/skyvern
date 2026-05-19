@@ -65,6 +65,11 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 {% endfor %}
 For fields not covered by these parameters, use `"ai": "proactive"` with a descriptive prompt (see Rule 9b).
 {% endif %}
+{% if self_output_key %}
+
+### Forbidden parameter key for this block
+- `{{ self_output_key }}` — this block's own output slot. It is `None` until the block has finished running, so `context.parameters['{{ self_output_key }}']` crashes inside this block with `'NoneType' object is not subscriptable`. Upstream blocks' `<label>_output` keys ARE valid; only this block's own output is forbidden.
+{% endif %}
 {% if run_parameter_values %}
 
 ## Current Run Parameter Values
@@ -86,6 +91,22 @@ The cached code failed and the AI agent took over. Here is what happened:
 - **Block Label**: {{ episode.block_label }}
 - **Fallback Type**: {{ episode.fallback_type }}
 - **Error**: {{ episode.error_message or "N/A" }}
+{% if episode.classify_result == "UNKNOWN" %}
+  ⚠️ `page.classify()` returned UNKNOWN — the runtime LLM rejected every named option. Add a new branch (prefer URL/text patterns over LLM-only options).
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.classify_rejection is defined %}
+- **Why the runtime LLM rejected the options**:
+  > {{ episode.agent_actions.classify_rejection.reasoning or "(no reasoning recorded)" }}
+{% if episode.agent_actions.classify_rejection.candidate_options %}
+  Options the LLM was given:
+{%- for opt_key, opt_desc in episode.agent_actions.classify_rejection.candidate_options.items() %}
+  - `{{ opt_key }}`: {{ opt_desc }}
+{%- endfor %}
+{% endif %}
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.exception_summary is defined and episode.agent_actions.exception_summary %}
+- **Recovery agent crashed mid-fallback**: `{{ episode.agent_actions.exception_summary }}`
+{% endif %}
 - **Page URL at failure**: {{ episode.page_url or "N/A" }}
 - **Page Text at failure**:
 ```
@@ -182,6 +203,13 @@ If the existing code already has a `page.wait()` and it still failed, increase t
    ```python
    await page.goto(url)
    await page.wait(timeout_ms=5000)  # wait for form fields to render
+   await page.fill_form(context.parameters, prompt='...')
+   ```
+
+4. **Before `fill_form()`/`fill_multipage_form()` when 0 fields are mapped** — If the error message says "fill_form mapped 0 of N form fields despite K data keys provided" or "fill_multipage_form mapped 0 of N form fields", the page rendered some fields but not the ones the script expects to fill (or with different labels). Add `await page.wait(timeout_ms=5000)` **before** the form-fill call to let the right structure render:
+   ```python
+   await page.goto(url)
+   await page.wait(timeout_ms=5000)  # wait for the expected form inputs to render
    await page.fill_form(context.parameters, prompt='...')
    ```
 

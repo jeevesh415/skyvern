@@ -3,6 +3,11 @@ from pathlib import Path
 
 # This is the attribute name used to tag interactable elements
 SKYVERN_ID_ATTR: str = "unique_id"
+
+# Value sent in the x-user-agent header by the Skyvern UI. Used to distinguish UI-triggered
+# runs from API/SDK callers (e.g. for trigger_type classification and routing strategy).
+SKYVERN_UI_USER_AGENT: str = "skyvern-ui"
+
 SKYVERN_DIR = Path(__file__).parent
 REPO_ROOT_DIR = SKYVERN_DIR.parent
 
@@ -11,7 +16,9 @@ PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds
 BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
 BROWSER_DOWNLOAD_MAX_WAIT_TIME = 120  # 2 minute
+BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_TIMEOUT = 600  # 10 minute
+DIALOG_LLM_TIMEOUT = 10  # 10 seconds
 DOWNLOAD_FILE_PREFIX = "downloads"
 SAVE_DOWNLOADED_FILES_TIMEOUT = 180
 GET_DOWNLOADED_FILES_TIMEOUT = 30
@@ -74,6 +81,17 @@ DEFAULT_LOGIN_COMPLETE_CRITERION = (
     "Check the page elements carefully for the indicators listed above. "
     "Do NOT assume login failed just because you are on the homepage or the same page as before."
 )
+
+# Template for wrapping a block-level mini-goal with the user's original prompt as context.
+# Used by both TaskV2 planning and the workflow-copilot-v2 tool handler so that every block's
+# navigation_goal carries the user's overarching intent — the verifier (complete_verify) can
+# then reason about completion against the user's goal rather than the block's narrow action
+# decomposition.
+MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
+```{mini_goal}```
+
+This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal:
+```{main_goal}```"""
 
 # reserved fields for navigation payload
 SPECIAL_FIELD_VERIFICATION_CODE = "verification_code"

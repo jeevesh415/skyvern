@@ -2,6 +2,7 @@ import { AxiosError } from "axios";
 import { useEffect, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
+import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import {
   SwitchBarNavigation,
@@ -39,6 +40,7 @@ import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkf
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
+import { filenameForDownloadedFileUrl } from "./workflowRun/blockDownloadedFiles";
 import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
@@ -62,6 +64,7 @@ function WorkflowRun() {
   const isEmbedded = embed === "true";
   const active = searchParams.get("active");
   const workflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowPermanentIdParam = useFirstParam("workflowPermanentId");
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
@@ -75,9 +78,11 @@ function WorkflowRun() {
 
   const status = (error as AxiosError | undefined)?.response?.status;
   const workflow = workflowRun?.workflow;
-  const workflowPermanentId = workflow?.workflow_permanent_id;
+  const workflowPermanentId =
+    workflowPermanentIdParam ?? workflow?.workflow_permanent_id;
   const cacheKey = workflow?.cache_key ?? "";
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
+  const isWorkflowDeleted = Boolean(workflow?.deleted_at);
 
   const [hasPublishedCode, setHasPublishedCode] = useState(false);
 
@@ -91,7 +96,7 @@ function WorkflowRun() {
     cacheKey,
     debounceMs: 100,
     page: 1,
-    workflowPermanentId,
+    workflowPermanentId: isWorkflowDeleted ? undefined : workflowPermanentId,
   });
 
   useEffect(() => {
@@ -104,7 +109,7 @@ function WorkflowRun() {
   const { data: blockScriptsPublished } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
-    workflowPermanentId,
+    workflowPermanentId: isWorkflowDeleted ? undefined : workflowPermanentId,
     pollIntervalMs: !hasPublishedCode && !isFinalized ? 3000 : undefined,
     status: "published",
     workflowRunId: workflowRun?.workflow_run_id,
@@ -157,7 +162,7 @@ function WorkflowRun() {
   const { data: fallbackEpisodes } = useFallbackEpisodesQuery({
     workflowPermanentId,
     workflowRunId: workflowRun?.workflow_run_id,
-    enabled: workflowRunIsFinalized === true,
+    enabled: workflowRunIsFinalized === true && !isWorkflowDeleted,
   });
   const finallyBlockLabel =
     workflow?.workflow_definition?.finally_block_label ?? null;
@@ -174,6 +179,8 @@ function WorkflowRun() {
 
   const title = workflowRunIsLoading ? (
     <Skeleton className="h-9 w-48" />
+  ) : isWorkflowDeleted ? (
+    <h1 className="text-3xl">{workflow!.title}</h1>
   ) : (
     <h1 className="text-3xl">
       <Link
@@ -229,7 +236,10 @@ function WorkflowRun() {
 
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div className="space-y-2 rounded-md border border-red-600 bg-error-light p-4">
-      <div className="font-bold">{failureReasonTitle}</div>
+      <div className="flex items-center gap-2">
+        <div className="font-bold">{failureReasonTitle}</div>
+        <FailureCategoryBadge failureCategory={workflowRun.failure_category} />
+      </div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}
       {shouldShowFinallyNote && (
@@ -357,8 +367,10 @@ function WorkflowRun() {
             </div>
             <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
             {workflowRun &&
-              (workflowRun.started_at || workflowRun.finished_at) && (
-                <div className="flex gap-4 text-sm text-slate-400">
+              (workflowRun.started_at ||
+                workflowRun.finished_at ||
+                isWorkflowDeleted) && (
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-slate-400">
                   {workflowRun.started_at && (
                     <span title={basicTimeFormat(workflowRun.started_at)}>
                       Started: {basicLocalTimeFormat(workflowRun.started_at)}
@@ -367,6 +379,12 @@ function WorkflowRun() {
                   {workflowRun.finished_at && (
                     <span title={basicTimeFormat(workflowRun.finished_at)}>
                       Finished: {basicLocalTimeFormat(workflowRun.finished_at)}
+                    </span>
+                  )}
+                  {isWorkflowDeleted && (
+                    <span title={basicTimeFormat(workflow!.deleted_at!)}>
+                      Workflow deleted on{" "}
+                      {basicLocalTimeFormat(workflow!.deleted_at!)}
                     </span>
                   )}
                 </div>
@@ -379,54 +397,68 @@ function WorkflowRun() {
                 Browser Session: {workflowRun.browser_session_id}
               </Link>
             )}
+            {workflowRun?.browser_profile_id && (
+              <Link
+                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
+                to={`/browser-profiles/${workflowRun.browser_profile_id}`}
+              >
+                Browser Profile: {workflowRun.browser_profile_id}
+              </Link>
+            )}
           </div>
 
           <div className="flex gap-2">
-            <ApiWebhookActionsMenu
-              getOptions={() => {
-                // Build headers - x-max-steps-override is optional and can be added manually if needed
-                const headers: Record<string, string> = {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                };
+            {!isWorkflowDeleted && (
+              <>
+                <ApiWebhookActionsMenu
+                  getOptions={() => {
+                    // Build headers - x-max-steps-override is optional and can be added manually if needed
+                    const headers: Record<string, string> = {
+                      "Content-Type": "application/json",
+                      "x-api-key": apiCredential ?? "<your-api-key>",
+                    };
 
-                const body: Record<string, unknown> = {
-                  workflow_id: workflowPermanentId,
-                  parameters: workflowRun?.parameters,
-                  proxy_location: proxyLocation,
-                };
+                    const body: Record<string, unknown> = {
+                      workflow_id: workflowPermanentId,
+                      parameters: workflowRun?.parameters,
+                      proxy_location: proxyLocation,
+                    };
 
-                if (maxScreenshotScrolls !== null) {
-                  body.max_screenshot_scrolls = maxScreenshotScrolls;
-                }
+                    if (maxScreenshotScrolls !== null) {
+                      body.max_screenshot_scrolls = maxScreenshotScrolls;
+                    }
 
-                if (workflowRun?.webhook_callback_url) {
-                  body.webhook_url = workflowRun.webhook_callback_url;
-                }
+                    if (workflowRun?.webhook_callback_url) {
+                      body.webhook_url = workflowRun.webhook_callback_url;
+                    }
 
-                return {
-                  method: "POST",
-                  url: `${runsApiBaseUrl}/run/workflows`,
-                  body,
-                  headers,
-                } satisfies ApiCommandOptions;
-              }}
-              webhookDisabled={workflowRunIsLoading || !workflowRunIsFinalized}
-              onTestWebhook={() => setReplayOpen(true)}
-            />
-            <WebhookReplayDialog
-              runId={workflowRunId ?? ""}
-              disabled={workflowRunIsLoading || !workflowRunIsFinalized}
-              open={replayOpen}
-              onOpenChange={setReplayOpen}
-              hideTrigger
-            />
-            <Button asChild variant="secondary">
-              <Link to={`/workflows/${workflowPermanentId}/build`}>
-                <Pencil2Icon className="mr-2 h-4 w-4" />
-                Edit
-              </Link>
-            </Button>
+                    return {
+                      method: "POST",
+                      url: `${runsApiBaseUrl}/run/workflows`,
+                      body,
+                      headers,
+                    } satisfies ApiCommandOptions;
+                  }}
+                  webhookDisabled={
+                    workflowRunIsLoading || !workflowRunIsFinalized
+                  }
+                  onTestWebhook={() => setReplayOpen(true)}
+                />
+                <WebhookReplayDialog
+                  runId={workflowRunId ?? ""}
+                  disabled={workflowRunIsLoading || !workflowRunIsFinalized}
+                  open={replayOpen}
+                  onOpenChange={setReplayOpen}
+                  hideTrigger
+                />
+                <Button asChild variant="secondary">
+                  <Link to={`/workflows/${workflowPermanentId}/build`}>
+                    <Pencil2Icon className="mr-2 h-4 w-4" />
+                    Edit
+                  </Link>
+                </Button>
+              </>
+            )}
             {workflowRunIsCancellable && (
               <Dialog>
                 <DialogTrigger asChild>
@@ -459,7 +491,7 @@ function WorkflowRun() {
                 </DialogContent>
               </Dialog>
             )}
-            {workflowRunIsFinalized && !isTaskv2Run && (
+            {workflowRunIsFinalized && !isTaskv2Run && !isWorkflowDeleted && (
               <Button asChild>
                 <Link
                   to={`/workflows/${workflowPermanentId}/run`}
@@ -469,6 +501,7 @@ function WorkflowRun() {
                     webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
                     maxScreenshotScrolls,
                     runWith: workflowRun?.run_with ?? "agent",
+                    browserProfileId: workflowRun?.browser_profile_id ?? null,
                   }}
                 >
                   <PlayIcon className="mr-2 h-4 w-4" />
@@ -511,9 +544,7 @@ function WorkflowRun() {
                 <ScrollAreaViewport className="max-h-[250px] space-y-2">
                   {fileUrls.length > 0 ? (
                     fileUrls.map((url) => {
-                      // Extract filename from URL path, stripping query params from signed URLs
-                      const urlPath = url.split("?")[0] ?? url;
-                      const filename = urlPath.split("/").pop() || "download";
+                      const filename = filenameForDownloadedFileUrl(url);
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />

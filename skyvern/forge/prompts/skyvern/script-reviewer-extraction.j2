@@ -13,7 +13,7 @@ You are a script reviewer for a browser automation system. Your job is to make a
     b. For form fields that need values but have NO matching parameter:
        - **Essay/freeform questions** (textarea, "Why do you want to work here?", "Describe a problem you solved"): use `ai='proactive'` with a descriptive prompt. The AI will generate a brief, professional answer using the workflow's overall context. Do NOT hardcode `'N/A'`.
        - **Short factual fields** (text inputs like "GitHub URL", "Portfolio"): use `ai='proactive'` with a prompt describing the field. The AI will provide a reasonable value or skip appropriately.
-       - **Dropdowns/radios with no parameter**: use `ai='fallback'` with a prompt (existing pattern — the AI picks the best option).
+       - **Dropdowns/radios with no parameter**: pair `selector=` (the dropdown/radiogroup element) with `ai='fallback'` and a descriptive `prompt=`. If you truly cannot pin down a selector, use `ai='proactive'` (omit `selector=`) instead — never combine `ai='fallback'` with a missing selector.
     c. NEVER hardcode `value='N/A'` for any field. Either use a parameter value or let the AI fill it with `ai='proactive'`.
 
 ## Key Difference for Extraction Blocks
@@ -59,6 +59,11 @@ These are the KNOWN parameter names for `context.parameters[...]`:
 {% endfor %}
 For fields not covered by these parameters, use `ai='proactive'` with a descriptive prompt (see Rule 8b).
 {% endif %}
+{% if self_output_key %}
+
+### Forbidden parameter key for this block
+- `{{ self_output_key }}` — this block's own output slot. It is `None` until the block has finished running, so `context.parameters['{{ self_output_key }}']` crashes inside this block with `'NoneType' object is not subscriptable`. Upstream blocks' `<label>_output` keys ARE valid; only this block's own output is forbidden.
+{% endif %}
 {% if run_parameter_values %}
 
 ## Current Run Parameter Values
@@ -81,6 +86,22 @@ The cached code failed and the AI agent took over. Here is what happened:
 - **Fallback Type**: {{ episode.fallback_type }}
 - **Error**: {{ episode.error_message or "N/A" }}
 - **Classify Result**: {{ episode.classify_result or "N/A" }}
+{% if episode.classify_result == "UNKNOWN" %}
+  ⚠️ `page.classify()` returned UNKNOWN — the runtime LLM rejected every named option. Add a new branch with URL/text patterns derived from the page data below.
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.classify_rejection is defined %}
+- **Why the runtime LLM rejected the options**:
+  > {{ episode.agent_actions.classify_rejection.reasoning or "(no reasoning recorded)" }}
+{% if episode.agent_actions.classify_rejection.candidate_options %}
+  Options the LLM was given:
+{%- for opt_key, opt_desc in episode.agent_actions.classify_rejection.candidate_options.items() %}
+  - `{{ opt_key }}`: {{ opt_desc }}
+{%- endfor %}
+{% endif %}
+{% endif %}
+{% if episode.agent_actions is mapping and episode.agent_actions.exception_summary is defined and episode.agent_actions.exception_summary %}
+- **Recovery agent crashed mid-fallback**: `{{ episode.agent_actions.exception_summary }}`
+{% endif %}
 - **Page URL at failure**: {{ episode.page_url or "N/A" }}
 - **Page Text at failure** (use this to derive text_patterns):
 ```

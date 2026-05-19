@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
+from typing import Any
 
 import structlog
 from sqlalchemy import and_, delete, distinct, func, or_, select, update
@@ -9,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.id import generate_script_block_id, generate_script_file_id
 from skyvern.forge.sdk.db.models import (
     ScriptBlockModel,
     ScriptBranchHitModel,
@@ -22,6 +26,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_script,
     convert_to_script_block,
     convert_to_script_file,
+    nullable_column_equals,
 )
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.scripts import (
@@ -35,6 +40,47 @@ from skyvern.schemas.scripts import (
 )
 
 LOG = structlog.get_logger()
+
+
+def _script_status_value(status: ScriptStatus | str) -> str:
+    return status.value if isinstance(status, ScriptStatus) else status
+
+
+def _workflow_script_matches_snapshot(workflow_script: WorkflowScript) -> list[Any]:
+    return [
+        WorkflowScriptModel.organization_id == workflow_script.organization_id,
+        WorkflowScriptModel.workflow_script_id == workflow_script.workflow_script_id,
+        WorkflowScriptModel.workflow_permanent_id == workflow_script.workflow_permanent_id,
+        WorkflowScriptModel.script_id == workflow_script.script_id,
+        nullable_column_equals(WorkflowScriptModel.workflow_id, workflow_script.workflow_id),
+        nullable_column_equals(WorkflowScriptModel.workflow_run_id, workflow_script.workflow_run_id),
+        WorkflowScriptModel.cache_key == workflow_script.cache_key,
+        WorkflowScriptModel.cache_key_value == workflow_script.cache_key_value,
+        WorkflowScriptModel.status == _script_status_value(workflow_script.status),
+        WorkflowScriptModel.is_pinned == workflow_script.is_pinned,
+        nullable_column_equals(WorkflowScriptModel.pinned_at, workflow_script.pinned_at),
+        nullable_column_equals(WorkflowScriptModel.pinned_by, workflow_script.pinned_by),
+        nullable_column_equals(WorkflowScriptModel.modified_at, workflow_script.modified_at),
+    ]
+
+
+class WorkflowScriptWriterIntent(StrEnum):
+    deploy = "deploy"
+    auto_regen = "auto_regen"
+    ensure_static = "ensure_static"
+
+
+class WorkflowScriptUpsertStatus(StrEnum):
+    created = "created"
+    updated = "updated"
+    blocked_by_pin = "blocked_by_pin"
+
+
+@dataclass(frozen=True)
+class WorkflowScriptUpsertResult:
+    status: WorkflowScriptUpsertStatus
+    workflow_script: WorkflowScript
+    previous_workflow_script: WorkflowScript | None = None
 
 
 class ScriptsRepository(BaseRepository):
@@ -230,25 +276,56 @@ class ScriptsRepository(BaseRepository):
         encoding: str = "utf-8",
         artifact_id: str | None = None,
     ) -> ScriptFile:
-        """Create a script file."""
+        """Create a script file. Idempotent on (script_revision_id, file_path)."""
         async with self.Session() as session:
-            script_file = ScriptFileModel(
-                script_revision_id=script_revision_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                file_path=file_path,
-                file_name=file_name,
-                file_type=file_type,
-                content_hash=content_hash,
-                file_size=file_size,
-                mime_type=mime_type,
-                encoding=encoding,
-                artifact_id=artifact_id,
+            now = datetime.now(timezone.utc)
+            stmt = (
+                insert(ScriptFileModel)
+                .values(
+                    file_id=generate_script_file_id(),
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type=file_type,
+                    content_hash=content_hash,
+                    file_size=file_size,
+                    mime_type=mime_type,
+                    encoding=encoding,
+                    artifact_id=artifact_id,
+                    created_at=now,
+                    modified_at=now,
+                )
+                .on_conflict_do_nothing(constraint="unique_script_file_path")
+                .returning(ScriptFileModel)
             )
-            session.add(script_file)
+            inserted = (await session.scalars(stmt)).first()
+            if inserted is None:
+                LOG.info(
+                    "create_script_file_idempotent_hit",
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                )
+                inserted = (
+                    await session.scalars(
+                        select(ScriptFileModel)
+                        .filter_by(script_revision_id=script_revision_id)
+                        .filter_by(file_path=file_path)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).first()
+                if inserted is None:
+                    raise RuntimeError(
+                        f"create_script_file: conflict row not owned by caller "
+                        f"organization_id={organization_id} "
+                        f"script_revision_id={script_revision_id} file_path={file_path}"
+                    )
+            converted = convert_to_script_file(inserted)
             await session.commit()
-            await session.refresh(script_file)
-            return convert_to_script_file(script_file)
+            return converted
 
     @db_operation("create_script_block")
     async def create_script_block(
@@ -264,24 +341,119 @@ class ScriptsRepository(BaseRepository):
         input_fields: list[str] | None = None,
         requires_agent: bool = False,
     ) -> ScriptBlock:
-        """Create a script block."""
+        """Create a script block. Idempotent on (script_revision_id, script_block_label)."""
         async with self.Session() as session:
-            script_block = ScriptBlockModel(
-                script_revision_id=script_revision_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                script_block_label=script_block_label,
-                script_file_id=script_file_id,
-                run_signature=run_signature,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                input_fields=input_fields,
-                requires_agent=requires_agent,
+            now = datetime.now(timezone.utc)
+            stmt = (
+                insert(ScriptBlockModel)
+                .values(
+                    script_block_id=generate_script_block_id(),
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    script_block_label=script_block_label,
+                    script_file_id=script_file_id,
+                    run_signature=run_signature,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    input_fields=input_fields,
+                    requires_agent=requires_agent,
+                    created_at=now,
+                    modified_at=now,
+                )
+                .on_conflict_do_nothing(constraint="uc_script_revision_id_script_block_label")
+                .returning(ScriptBlockModel)
             )
-            session.add(script_block)
+            inserted = (await session.scalars(stmt)).first()
+            if inserted is None:
+                LOG.info(
+                    "create_script_block_idempotent_hit",
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    script_block_label=script_block_label,
+                )
+                inserted = (
+                    await session.scalars(
+                        select(ScriptBlockModel)
+                        .filter_by(script_revision_id=script_revision_id)
+                        .filter_by(script_block_label=script_block_label)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).first()
+                if inserted is None:
+                    raise RuntimeError(
+                        f"create_script_block: conflict row not owned by caller "
+                        f"organization_id={organization_id} "
+                        f"script_revision_id={script_revision_id} "
+                        f"script_block_label={script_block_label}"
+                    )
+            converted = convert_to_script_block(inserted)
             await session.commit()
-            await session.refresh(script_block)
-            return convert_to_script_block(script_block)
+            return converted
+
+    @db_operation("upsert_script_block")
+    async def upsert_script_block(
+        self,
+        script_revision_id: str,
+        script_id: str,
+        organization_id: str,
+        script_block_label: str,
+        script_file_id: str | None = None,
+        run_signature: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        input_fields: list[str] | None = None,
+        requires_agent: bool | None = None,
+    ) -> ScriptBlock:
+        """Insert or update a script block for a script revision.
+
+        ``requires_agent=None`` preserves an existing row's value on conflict
+        and inserts False for new rows. Callers that want a deploy-time
+        preserve policy should resolve the prior revision's value before
+        calling this method.
+        """
+        async with self.Session() as session:
+            now = datetime.now(timezone.utc)
+            insert_values = {
+                "script_block_id": generate_script_block_id(),
+                "script_revision_id": script_revision_id,
+                "script_id": script_id,
+                "organization_id": organization_id,
+                "script_block_label": script_block_label,
+                "script_file_id": script_file_id,
+                "run_signature": run_signature,
+                "workflow_run_id": workflow_run_id,
+                "workflow_run_block_id": workflow_run_block_id,
+                "input_fields": input_fields,
+                "requires_agent": requires_agent if requires_agent is not None else False,
+                "created_at": now,
+                "modified_at": now,
+            }
+            update_values: dict[str, Any] = {
+                "script_file_id": script_file_id,
+                "run_signature": run_signature,
+                "workflow_run_id": workflow_run_id,
+                "workflow_run_block_id": workflow_run_block_id,
+                "input_fields": input_fields,
+                "modified_at": now,
+            }
+            if requires_agent is not None:
+                update_values["requires_agent"] = requires_agent
+
+            stmt = (
+                insert(ScriptBlockModel)
+                .values(**insert_values)
+                .on_conflict_do_update(
+                    constraint="uc_script_revision_id_script_block_label",
+                    set_=update_values,
+                )
+                .returning(ScriptBlockModel)
+            )
+            script_block = (await session.scalars(stmt)).one()
+            converted = convert_to_script_block(script_block)
+            await session.commit()
+            return converted
 
     @db_operation("update_script_block")
     async def update_script_block(
@@ -501,6 +673,92 @@ class ScriptsRepository(BaseRepository):
             session.add(record)
             await session.commit()
 
+    @db_operation("upsert_workflow_script")
+    async def upsert_workflow_script(
+        self,
+        *,
+        organization_id: str,
+        script_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        cache_key_value: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        status: ScriptStatus = ScriptStatus.published,
+        is_pinned: bool = False,
+        pinned_by: str | None = None,
+        writer_intent: WorkflowScriptWriterIntent = WorkflowScriptWriterIntent.deploy,
+    ) -> WorkflowScriptUpsertResult:
+        """Create/update an active workflow-script mapping with sticky-pin semantics."""
+        async with self.Session() as session:
+            now = datetime.now(timezone.utc)
+            status_value = status.value if isinstance(status, ScriptStatus) else status
+            existing_rows = (
+                await session.scalars(
+                    select(WorkflowScriptModel)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
+                        WorkflowScriptModel.status == status_value,
+                    )
+                    .order_by(WorkflowScriptModel.created_at.desc())
+                    .with_for_update()
+                )
+            ).all()
+
+            existing = existing_rows[0] if existing_rows else None
+            if existing is None:
+                record = WorkflowScriptModel(
+                    organization_id=organization_id,
+                    script_id=script_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_key_value=cache_key_value,
+                    status=status_value,
+                    is_pinned=is_pinned,
+                    pinned_at=now if is_pinned else None,
+                    pinned_by=pinned_by if is_pinned else None,
+                )
+                session.add(record)
+                await session.commit()
+                await session.refresh(record)
+                return WorkflowScriptUpsertResult(
+                    status=WorkflowScriptUpsertStatus.created,
+                    workflow_script=WorkflowScript.model_validate(record),
+                )
+
+            if existing.is_pinned and not is_pinned and writer_intent != WorkflowScriptWriterIntent.deploy:
+                workflow_script = WorkflowScript.model_validate(existing)
+                await session.commit()
+                return WorkflowScriptUpsertResult(
+                    status=WorkflowScriptUpsertStatus.blocked_by_pin,
+                    workflow_script=workflow_script,
+                )
+
+            previous_workflow_script = WorkflowScript.model_validate(existing)
+            existing.script_id = script_id
+            existing.workflow_id = workflow_id
+            existing.workflow_run_id = workflow_run_id
+            existing.cache_key = cache_key
+            existing.status = status_value
+            existing.modified_at = now
+            if is_pinned and not existing.is_pinned:
+                existing.is_pinned = True
+                existing.pinned_at = now
+                existing.pinned_by = pinned_by
+
+            await session.commit()
+            await session.refresh(existing)
+            return WorkflowScriptUpsertResult(
+                status=WorkflowScriptUpsertStatus.updated,
+                workflow_script=WorkflowScript.model_validate(existing),
+                previous_workflow_script=previous_workflow_script,
+            )
+
     @db_operation("get_workflow_script")
     async def get_workflow_script(
         self,
@@ -521,6 +779,35 @@ class ScriptsRepository(BaseRepository):
             workflow_script_model = (await session.scalars(query)).first()
             return WorkflowScript.model_validate(workflow_script_model) if workflow_script_model else None
 
+    @db_operation("get_workflow_script_source_workflow_id")
+    async def get_workflow_script_source_workflow_id(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        script_id: str,
+        cache_key_value: str,
+    ) -> str | None:
+        """Return the workflow version (w_*) that produced a given cached script row.
+
+        Used to detect when the workflow definition has changed since the cached
+        script was generated (SKY-9254).
+        """
+        async with self.Session() as session:
+            query = (
+                select(WorkflowScriptModel.workflow_id)
+                .where(
+                    WorkflowScriptModel.organization_id == organization_id,
+                    WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowScriptModel.script_id == script_id,
+                    WorkflowScriptModel.cache_key_value == cache_key_value,
+                    WorkflowScriptModel.deleted_at.is_(None),
+                )
+                .order_by(WorkflowScriptModel.created_at.desc())
+                .limit(1)
+            )
+            return (await session.scalars(query)).first()
+
     @db_operation("get_workflow_script_by_cache_key_value")
     async def get_workflow_script_by_cache_key_value(
         self,
@@ -535,14 +822,16 @@ class ScriptsRepository(BaseRepository):
         """Get latest script version linked to a workflow by a specific cache_key_value.
 
         Returns:
-            A tuple of (script, is_pinned). The repository implementation does not
-            support pinned queries, so is_pinned is always False.
+            A tuple of (script, is_pinned) where ``is_pinned`` is the
+            ``workflow_scripts.is_pinned`` flag on the row that resolved the
+            lookup. Callers (e.g. the script reviewer's pin check) rely on
+            this flag to decide whether to regenerate.
         """
         async with self.Session() as session:
             # Build the query: join workflow_scripts with scripts
-            # Join on both script_id and organization_id to leverage uc_org_script_version index
+            # Join on both script_id and organization_id to leverage uc_org_script_version index.
             query = (
-                select(ScriptModel)
+                select(ScriptModel, WorkflowScriptModel.is_pinned)
                 .join(
                     WorkflowScriptModel,
                     and_(
@@ -573,10 +862,19 @@ class ScriptsRepository(BaseRepository):
             if statuses is not None and len(statuses) > 0:
                 query = query.where(WorkflowScriptModel.status.in_(statuses))
 
-            query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
+            # Prefer pinned workflow_scripts rows on ties — a stray un-pinned
+            # row for the same cache_key_value must not shadow an explicit pin.
+            query = query.order_by(
+                WorkflowScriptModel.is_pinned.desc(),
+                ScriptModel.created_at.desc(),
+                ScriptModel.version.desc(),
+            ).limit(1)
 
-            script = (await session.scalars(query)).first()
-            return (convert_to_script(script), False) if script else (None, False)
+            row = (await session.execute(query)).first()
+            if row is None:
+                return None, False
+            script_model, is_pinned = row
+            return convert_to_script(script_model), bool(is_pinned)
 
     @db_operation("get_workflow_cache_key_count")
     async def get_workflow_cache_key_count(
@@ -656,6 +954,74 @@ class ScriptsRepository(BaseRepository):
                 .values(deleted_at=datetime.now(timezone.utc))
             )
 
+            result = await session.execute(stmt)
+            await session.commit()
+
+            return result.rowcount > 0
+
+    @db_operation("soft_delete_workflow_script_if_matches")
+    async def soft_delete_workflow_script_if_matches(
+        self,
+        *,
+        workflow_script: WorkflowScript,
+    ) -> bool:
+        """Soft delete one workflow_scripts row if it still matches a snapshot.
+
+        Failed manual deploy cleanup uses this to avoid deleting a row that a
+        concurrent successful deploy already changed.
+        """
+        async with self.Session() as session:
+            stmt = (
+                update(WorkflowScriptModel)
+                .where(
+                    and_(
+                        *_workflow_script_matches_snapshot(workflow_script),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                )
+                .values(deleted_at=datetime.now(timezone.utc))
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+
+            return result.rowcount > 0
+
+    @db_operation("restore_workflow_script_if_matches")
+    async def restore_workflow_script_if_matches(
+        self,
+        *,
+        current_workflow_script: WorkflowScript,
+        restore_workflow_script: WorkflowScript,
+    ) -> bool:
+        """Restore one workflow_scripts row if it still matches a written snapshot.
+
+        The live-row predicate prevents cleanup from resurrecting a row another
+        actor soft-deleted after this deploy's forward write.
+        """
+        async with self.Session() as session:
+            status = _script_status_value(restore_workflow_script.status)
+            stmt = (
+                update(WorkflowScriptModel)
+                .where(
+                    and_(
+                        *_workflow_script_matches_snapshot(current_workflow_script),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                )
+                .values(
+                    script_id=restore_workflow_script.script_id,
+                    workflow_id=restore_workflow_script.workflow_id,
+                    workflow_run_id=restore_workflow_script.workflow_run_id,
+                    cache_key=restore_workflow_script.cache_key,
+                    cache_key_value=restore_workflow_script.cache_key_value,
+                    status=status,
+                    is_pinned=restore_workflow_script.is_pinned,
+                    pinned_at=restore_workflow_script.pinned_at,
+                    pinned_by=restore_workflow_script.pinned_by,
+                    modified_at=restore_workflow_script.modified_at,
+                    deleted_at=restore_workflow_script.deleted_at,
+                )
+            )
             result = await session.execute(stmt)
             await session.commit()
 

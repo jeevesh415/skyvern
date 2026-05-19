@@ -13,9 +13,9 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NonTerminalFinallyBlock,
     WorkflowDefinitionHasDuplicateBlockLabels,
 )
-from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
-from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
+from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.url_validators import validate_url
@@ -35,6 +35,7 @@ class WorkflowRequestBody(BaseModel):
     browser_address: str | None = None
     run_with: str | None = None
     ai_fallback: bool | None = None
+    run_metadata: dict[str, str] | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -42,6 +43,11 @@ class WorkflowRequestBody(BaseModel):
         if not url:
             return url
         return validate_url(url)
+
+    @field_validator("run_metadata")
+    @classmethod
+    def validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return normalize_run_metadata(v)
 
 
 @deprecated("Use WorkflowRunResponse instead")
@@ -56,6 +62,7 @@ class WorkflowDefinition(BaseModel):
     blocks: List[BlockTypeVar]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    workflow_system_prompt: str | None = None
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -67,7 +74,7 @@ class WorkflowDefinition(BaseModel):
                     duplicate_labels.add(block.label)
                 else:
                     all_labels.add(block.label)
-                if isinstance(block, ForLoopBlock) and block.loop_blocks:
+                if isinstance(block, (ForLoopBlock, WhileLoopBlock)) and block.loop_blocks:
                     _collect_labels(block.loop_blocks)
 
         _collect_labels(self.blocks)
@@ -100,6 +107,7 @@ class Workflow(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    browser_profile_id: str | None = None
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
@@ -114,6 +122,8 @@ class Workflow(BaseModel):
     sequential_key: str | None = None
     folder_id: str | None = None
     import_error: str | None = None
+    created_by: str | None = None
+    edited_by: str | None = None
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -157,6 +167,17 @@ class WorkflowRunStatus(StrEnum):
             WorkflowRunStatus.completed,
         ]
 
+    def is_final_excluding_canceled(self) -> bool:
+        """Like :meth:`is_final` but excludes ``canceled``.
+
+        For callers that can't distinguish a legitimate user/block cancel from
+        a synthetic ``canceled`` written as a last-resort fallback — e.g. the
+        copilot tool reading the row AFTER ``mark_workflow_run_as_canceled_if_not_final``
+        has run. Callers that want to trust a legitimate ``canceled`` must read
+        the row BEFORE invoking any cancel helper.
+        """
+        return self.is_final() and self is not WorkflowRunStatus.canceled
+
 
 class WorkflowRun(BaseModel):
     workflow_run_id: str
@@ -188,6 +209,10 @@ class WorkflowRun(BaseModel):
     code_gen: bool | None = None
     trigger_type: WorkflowRunTriggerType | None = None
     workflow_schedule_id: str | None = None
+    ignore_inherited_workflow_system_prompt: bool = False
+    copilot_session_id: str | None = None
+    credits_used: int = 0
+    cached_credits_used: int = 0
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -204,25 +229,42 @@ class WorkflowRun(BaseModel):
     modified_at: datetime
 
 
-def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
-    """Compute effective adaptive caching mode from run-level override or workflow setting.
+def is_adaptive_caching_from_effective_state(
+    *,
+    workflow_run_with: str,
+    run_run_with: str | None,
+    code_version: int | None,
+    adaptive_caching: bool,
+) -> bool:
+    """Compute adaptive caching from explicit workflow/run dispatch state.
 
     Uses code_version >= 2 as the primary check. Falls back to the legacy
     adaptive_caching bool for rows that haven't been backfilled yet
     (code_version is None).
 
-    WorkflowRun.run_with is None when not explicitly set (inherits from workflow).
-    Workflow.run_with is always "code" or "agent" after normalization.
+    ``run_run_with`` is None when the run inherits from the workflow. This
+    helper is shared by runtime and deploy-time cache-key resolution so the
+    ``:v2`` suffix decision stays in one place.
     """
-    run_with = workflow_run.run_with or workflow.run_with
+    run_with = normalize_run_with(run_run_with) if run_run_with is not None else normalize_run_with(workflow_run_with)
     if run_with == "agent":
         return False
     # run_with == "code": check code_version
     if run_with == "code":
-        if workflow.code_version is not None:
-            return workflow.code_version >= 2
-        return workflow.adaptive_caching
+        if code_version is not None:
+            return code_version >= 2
+        return adaptive_caching
     return False
+
+
+def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
+    """Compute effective adaptive caching mode from run-level override or workflow setting."""
+    return is_adaptive_caching_from_effective_state(
+        workflow_run_with=workflow.run_with,
+        run_run_with=workflow_run.run_with,
+        code_version=workflow.code_version,
+        adaptive_caching=workflow.adaptive_caching,
+    )
 
 
 class WorkflowRunParameter(BaseModel):
@@ -244,6 +286,7 @@ class WorkflowRunResponseBase(BaseModel):
     workflow_run_id: str
     status: WorkflowRunStatus
     failure_reason: str | None = None
+    failure_category: list[dict[str, Any]] | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None
@@ -258,6 +301,7 @@ class WorkflowRunResponseBase(BaseModel):
     parameters: dict[str, Any]
     screenshot_urls: list[str] | None = None
     recording_url: str | None = None
+    recording_urls: list[str] | None = None
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None

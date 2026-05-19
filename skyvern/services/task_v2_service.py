@@ -9,6 +9,7 @@ from opentelemetry import trace as otel_trace
 from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
+from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
     FailedToSendWebhook,
     TaskTerminationError,
@@ -25,7 +26,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
@@ -64,6 +65,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.webeye.browser_state import BrowserState
@@ -76,12 +78,6 @@ RANDOM_STRING_POOL = string.ascii_letters + string.digits
 # Maximum number of planning iterations for TaskV2
 # This limits how many times the LLM can plan and execute actions
 DEFAULT_MAX_ITERATIONS = 50
-
-MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
-```{mini_goal}```
-
-This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal:
-```{main_goal}```"""
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
@@ -150,6 +146,7 @@ async def _summarize_max_steps_failure_reason(
             screenshots=screenshots,
             prompt_name="task_v2_summarize-max-steps-reason",
             thought=thought,
+            system_prompt=task_v2.workflow_system_prompt,
         )
         return json_response.get("reasoning", ""), json_response.get("failure_categories")
     except Exception:
@@ -257,6 +254,7 @@ async def initialize_task_v2(
     parent_workflow_run_id: str | None = None,
     extracted_information_schema: dict | list | str | None = None,
     error_code_mapping: dict | None = None,
+    workflow_system_prompt: str | None = None,
     create_task_run: bool = False,
     model: dict[str, Any] | None = None,
     max_screenshot_scrolling_times: int | None = None,
@@ -264,6 +262,7 @@ async def initialize_task_v2(
     extra_http_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
     run_with: str | None = None,
+    trigger_type: WorkflowRunTriggerType | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.observer.create_task_v2(
         prompt=user_prompt,
@@ -275,6 +274,7 @@ async def initialize_task_v2(
         proxy_location=proxy_location,
         extracted_information_schema=extracted_information_schema,
         error_code_mapping=error_code_mapping,
+        workflow_system_prompt=workflow_system_prompt,
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
@@ -315,6 +315,7 @@ async def initialize_task_v2(
             version=None,
             max_steps_override=max_steps_override,
             parent_workflow_run_id=parent_workflow_run_id,
+            trigger_type=trigger_type,
         )
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
@@ -386,6 +387,7 @@ async def initialize_task_v2_metadata(
         prompt=metadata_prompt,
         thought=thought,
         prompt_name="task_v2_generate_metadata",
+        system_prompt=task_v2.workflow_system_prompt,
     )
 
     # validate
@@ -455,7 +457,7 @@ async def initialize_task_v2_metadata(
     return task_v2
 
 
-@traced()
+@traced(name="skyvern.task_v2.run")
 async def run_task_v2(
     organization: Organization,
     task_v2_id: str,
@@ -485,6 +487,9 @@ async def run_task_v2(
     workflow, workflow_run = None, None
     parent_context = skyvern_context.current()
     current_run_id = parent_context.run_id if parent_context and parent_context.run_id else task_v2_id
+    # Carry trigger_type + use_flex_llm_routing forward from the parent context (set in
+    # scripts/run_task_v2.py at worker boot) so flex routing eligibility persists into the
+    # scoped TaskV2 execution context.
     context = SkyvernContext(
         organization_id=organization_id,
         organization_name=organization.organization_name,
@@ -494,6 +499,8 @@ async def run_task_v2(
         request_id=request_id,
         browser_session_id=browser_session_id,
         loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
+        trigger_type=parent_context.trigger_type if parent_context else None,
+        use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
@@ -651,12 +658,6 @@ async def run_task_v2_helper(
     context.run_id = current_run_id
     context.browser_session_id = browser_session_id
     context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
-    enable_parse_select_in_extract = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-        "ENABLE_PARSE_SELECT_IN_EXTRACT",
-        current_run_id,
-        properties={"organization_id": organization_id, "task_url": task_v2.url},
-    )
-    context.enable_parse_select_in_extract = bool(enable_parse_select_in_extract)
 
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
@@ -834,6 +835,7 @@ async def run_task_v2_helper(
                 screenshots=scraped_page.screenshots,
                 thought=thought,
                 prompt_name="task_v2",
+                system_prompt=task_v2.workflow_system_prompt,
             )
             LOG.info(
                 "Task v2 response",
@@ -1084,6 +1086,7 @@ async def run_task_v2_helper(
                 screenshots=completion_screenshots,
                 thought=thought,
                 prompt_name="task_v2_check_completion",
+                system_prompt=task_v2.workflow_system_prompt,
             )
             LOG.info(
                 "Task v2 completion check response",
@@ -1470,6 +1473,7 @@ async def _generate_loop_task(
         screenshots=scraped_page.screenshots,
         thought=thought_task_in_loop,
         prompt_name="task_v2_generate_task_block",
+        system_prompt=task_v2.workflow_system_prompt,
     )
     LOG.info("Task in loop metadata response", task_in_loop_metadata_response=task_in_loop_metadata_response)
     navigation_goal = task_in_loop_metadata_response.get("navigation_goal")
@@ -1576,6 +1580,7 @@ async def _generate_extraction_task(
                 task_v2=task_v2,
                 prompt_name="task_v2_generate_extraction_task",
                 organization_id=task_v2.organization_id,
+                system_prompt=task_v2.workflow_system_prompt,
             )
             break
         except (InvalidLLMResponseFormat, EmptyLLMResponseError) as e:
@@ -1976,6 +1981,7 @@ async def _summarize_task_v2(
         screenshots=screenshots,
         thought=thought,
         prompt_name="task_v2_summary",
+        system_prompt=task_v2.workflow_system_prompt,
     )
     LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp)
 
@@ -2052,6 +2058,8 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
 async def send_task_v2_webhook(task_v2: TaskV2) -> None:
     if not task_v2.webhook_callback_url:
         return
+    # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
+    task_v2.webhook_callback_url = task_v2.webhook_callback_url.strip()
     organization_id = task_v2.organization_id
     if not organization_id:
         return
@@ -2082,7 +2090,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             payload_length=len(payload),
             header_keys=sorted(headers.keys()),
         )
-        resp = await app.AGENT_FUNCTION.deliver_webhook(
+        resp = await deliver_webhook_with_retries(
             url=task_v2.webhook_callback_url,
             payload=payload,
             headers=headers,

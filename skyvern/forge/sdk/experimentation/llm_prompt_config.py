@@ -44,7 +44,7 @@ async def get_llm_config_by_prompt_type(distinct_id: str, organization_id: str |
         )
         return None
 
-    LOG.info(
+    LOG.debug(
         "LLM config by prompt type experiment enabled",
         distinct_id=distinct_id,
         organization_id=organization_id,
@@ -59,11 +59,12 @@ async def get_llm_handler_for_prompt_type(
 ) -> LLMAPIHandler | None:
     """Return initialized handler for prompt type from LLM_CONFIG_BY_PROMPT_TYPE flag."""
     config = await get_llm_config_by_prompt_type(distinct_id, organization_id)
-    if not config or prompt_type not in config:
-        LOG.warning(
-            "No config found for prompt type",
+    if not config:
+        return None
+    if prompt_type not in config:
+        LOG.debug(
+            "Prompt type not in LLM config, using default handler",
             prompt_type=prompt_type,
-            config=config,
             distinct_id=distinct_id,
             organization_id=organization_id,
         )

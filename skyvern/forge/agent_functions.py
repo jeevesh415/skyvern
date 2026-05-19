@@ -2,7 +2,7 @@ import asyncio
 import copy
 import hashlib
 from datetime import timedelta
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import httpx
 import structlog
@@ -14,11 +14,15 @@ from skyvern.exceptions import DisabledBlockExecutionError, StepUnableToExecuteE
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.webeye.actions.actions import Action
@@ -26,6 +30,9 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
 LOG = structlog.get_logger()
 
@@ -438,6 +445,96 @@ class AgentFunction:
     Cloud overrides this to True and provides the Temporal-backed implementations below.
     """
 
+    def get_flex_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
+
+        Cloud overrides this with the Gemini family → flex+GPT-5-fallback mapping.
+        OSS no-op so self-hosted users without flex routers see no behavior change.
+        """
+        return None
+
+    async def should_use_flex_llm_routing(
+        self,
+        *,
+        trigger_type: "WorkflowRunTriggerType | None",
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_run_id: str,
+    ) -> bool:
+        """Decide whether a given workflow run is eligible for flex-tier LLM routing.
+
+        Cloud overrides this to consult its experimentation provider; OSS has no flex
+        routers so the default returns False.
+        """
+        return False
+
+    async def record_workflow_run_metadata(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+    ) -> None:
+        """Persist per-run analytics metadata. OSS builds have no sidecar table."""
+        return None
+
+    # Phrases that indicate a magic-link confirmation page meant to be closed.
+    # Keep lowercase; matching is case-insensitive.
+    MAGIC_LINK_CLOSE_SIGNALS: tuple[str, ...] = (
+        "close this page",
+        "close this tab",
+        "close this window",
+        "you can close",
+        "you may now close",
+        "safe to close",
+        "return to the original page",
+        "return to the original tab",
+    )
+
+    def get_mcp_oauth_issuer_url(self) -> str | None:
+        """Return the cloud OAuth issuer URL when the build provides one.
+
+        OSS builds do not ship a remote OAuth issuer, so the base implementation
+        returns None and callers should treat OAuth validation as unavailable.
+        """
+        return None
+
+    async def get_mcp_oauth_jwt_key(self) -> Any | None:
+        """Return the current signing key/JWK for MCP OAuth token validation.
+
+        Cloud builds override this to provide the identity-provider signing key.
+        OSS builds return None.
+        """
+        return None
+
+    def build_mcp_auth_db(self, database_string: str, *, debug_enabled: bool) -> Any:
+        """Return the DB instance used by MCP auth middleware.
+
+        OSS builds use the base ``AgentDB``. Cloud overrides this to provide
+        the encryption-aware ``CloudAgentDB`` implementation without importing
+        cloud modules from the OSS-synced ``skyvern/`` tree.
+        """
+        return AgentDB(database_string, debug_enabled=debug_enabled)
+
+    def build_azure_client_factory(self, factory: AzureClientFactory) -> AzureClientFactory:
+        return factory
+
+    def resolve_mcp_oauth_org_lookups(self, db: object) -> tuple[Any, Any] | None:
+        """Return ``(get_organization_entities, get_valid_org_auth_token)`` callables
+        bound to the cloud DB's nested organizations repository.
+
+        OSS no-op — the OSS path in ``_get_oauth_org_auth_methods`` probes the
+        flat shape directly. Cloud overrides this to expose the
+        ``CloudAgentDB.organizations`` repository's methods so the OSS-synced
+        ``mcp_http_auth`` module doesn't need to know about cloud-specific
+        DB layout.
+        """
+        return None
+
+    async def resolve_org_api_key(self, organization_id: str) -> str | None:
+        """Return an org-scoped API key; returns None in the base implementation."""
+        return None
+
     async def validate_step_execution(
         self,
         task: Task,
@@ -495,14 +592,129 @@ class AgentFunction:
         return None
 
     async def post_step_execution(self, task: Task, step: Step) -> None:
-        return
+        if step.status == StepStatus.completed:
+            await self._maybe_close_magic_link_page(task)
+
+    async def _maybe_close_magic_link_page(self, task: Task) -> None:
+        """Close a magic-link confirmation page if it shows close/return signals.
+
+        Some magic-link flows open a new tab for verification.
+        After the user clicks "Allow", the page says "close this page and return
+        to the original page".  The LLM may miss the CLOSE_PAGE action, leaving
+        the tab open.  This fallback detects such confirmation pages and closes
+        them so subsequent workflow blocks see the original page.
+        """
+        context = skyvern_context.current()
+        if not context:
+            return
+
+        if not context.has_magic_link_page(task.task_id):
+            return
+
+        page = context.magic_link_pages[task.task_id]
+
+        try:
+            visible_text = (await page.inner_text("body", timeout=5000)).lower()
+        except Exception:
+            LOG.warning(
+                "Failed to read magic link page content, skipping auto-close",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return
+
+        matched_signal = next(
+            (signal for signal in self.MAGIC_LINK_CLOSE_SIGNALS if signal in visible_text),
+            None,
+        )
+        if matched_signal is None:
+            LOG.debug(
+                "Magic link page does not contain close signals, keeping open",
+                task_id=task.task_id,
+                page_url=page.url,
+            )
+            return
+
+        LOG.info(
+            "Magic link confirmation page detected, auto-closing",
+            task_id=task.task_id,
+            page_url=page.url,
+            matched_signal=matched_signal,
+        )
+        try:
+            async with asyncio.timeout(5):
+                await page.close()
+        except Exception:
+            # Intentionally keep the stale reference so the next completed step
+            # retries the close.  Eventually page.is_closed() will return True
+            # and the entry will be cleaned up at the top of this method.
+            LOG.warning(
+                "Failed to close magic link page, will retry on next step",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return
+
+        context.magic_link_pages.pop(task.task_id, None)
+        LOG.info(
+            "Magic link page closed successfully",
+            task_id=task.task_id,
+        )
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
+    async def release_proxy_session_for_owner(self, owner_id: str) -> None:
+        """Release any proxy lease held by ``owner_id``.
+
+        OSS no-op. Cloud overrides this to release the lease back to the
+        proxy-session pool so workflow/task cleanup doesn't have to
+        import cloud-only modules from the OSS-synced ``skyvern/`` tree.
+        """
+        return None
+
+    async def wait_for_challenge_solver(self, page: Page) -> None:
+        """Wait for a cloud-managed challenge solver if one is attached to the page.
+
+        OSS no-op. Cloud overrides this so OSS-synced browser/action code can
+        wait at navigation/action boundaries without importing cloud modules.
+        """
+        return None
+
     async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
         """Cloud-overridable sample gate for extract-information shadow mode. OSS no-op."""
         return False
+
+    async def lookup_cross_run_extraction_cache(
+        self,
+        workflow_permanent_id: str | None,
+        cache_key: str,
+    ) -> Any | None:
+        """Cross-run (wpid-scoped) extraction-cache read. OSS no-op.
+
+        Cloud overrides this to consult the Redis tier (SKY-8873). Returns the
+        cached extraction value on a hit or None on a miss / error / disabled
+        flag. Implementations MUST swallow backend errors and return None so
+        the extract path always falls through to a fresh LLM call rather than
+        failing loud.
+        """
+        return None
+
+    async def store_cross_run_extraction_cache(
+        self,
+        workflow_permanent_id: str | None,
+        cache_key: str,
+        value: Any,
+    ) -> None:
+        """Cross-run (wpid-scoped) extraction-cache write. OSS no-op.
+
+        Cloud overrides this to write to the Redis tier (SKY-8873) with a
+        long TTL. Called after a fresh LLM extraction so subsequent runs of
+        the same workflow against the same page content skip the LLM call.
+        Implementations MUST swallow backend errors — write-path failures
+        must never fail the user-visible request.
+        """
+        return None
 
     def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
         """Return the backend-specific schedule id used by the execution engine.
@@ -549,6 +761,168 @@ class AgentFunction:
         Cloud override provides actual solving; OSS base is a no-op."""
         return False
 
+    async def get_google_sheets_credentials(
+        self,
+        organization_id: str,
+        credential_id: str,
+    ) -> str | None:
+        """Mint a Google Sheets access token from the stored refresh token.
+
+        Returns None on any failure so callers can surface a reconnect prompt
+        instead of crashing. Cloud overrides this with an access-token cache
+        on top of the same backend.
+        """
+        try:
+            secrets = await google_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return await google_oauth_service.access_token_from_secrets(secrets)
+        except google_oauth_service.EncryptionNotConfiguredError:
+            LOG.error(
+                "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+        except Exception:
+            LOG.exception(
+                "Failed to get Google Sheets credentials",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+
+    async def get_google_workspace_credentials(
+        self,
+        organization_id: str,
+        credential_id: str,
+        required_scopes: list[str] | None = None,
+    ) -> object | None:
+        """Return a refreshed ``google.oauth2.credentials.Credentials``, or None on failure.
+
+        ``required_scopes`` is accepted for forward-compat with cloud overrides
+        that may enforce scope checks; the OSS path does not yet use it.
+        """
+        if required_scopes:
+            # Debug-level so OSS operators don't see this on every call; scope
+            # enforcement lives on the cloud override and a future caller can
+            # grep for this message if they need to audit usage.
+            LOG.debug(
+                "required_scopes ignored by OSS get_google_workspace_credentials; cloud override gates this",
+                required_scopes=required_scopes,
+                credential_id=credential_id,
+            )
+        try:
+            secrets = await google_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return await google_oauth_service.credentials_from_secrets(secrets)
+        except google_oauth_service.EncryptionNotConfiguredError:
+            LOG.error(
+                "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+        except Exception:
+            LOG.exception(
+                "Failed to get Google Workspace credentials",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+
+    async def ensure_sheet_tab(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        title: str,
+    ) -> int | None:
+        """Ensure a sheet tab with the given title exists in the spreadsheet.
+
+        Returns the sheet_id of the newly created tab, or None if the caller
+        should fall back to its own lookup (e.g. a concurrent creator won the
+        race). OSS base is a no-op that returns None; cloud override calls the
+        Sheets v4 batchUpdate addSheet endpoint.
+        """
+        return None
+
+    async def google_sheets_values_get(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        ranges: str,
+        fields: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read ranges from a spreadsheet via spreadsheets.get. OSS no-op."""
+        return None
+
+    async def google_sheets_values_append(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        range_: str,
+        values: list[list[Any]],
+    ) -> dict[str, Any] | None:
+        """Append rows via spreadsheets.values.append. OSS no-op."""
+        return None
+
+    async def google_sheets_values_update(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        range_: str,
+        values: list[list[Any]],
+    ) -> dict[str, Any] | None:
+        """Update rows via spreadsheets.values.update. OSS no-op."""
+        return None
+
+    async def google_sheets_batch_update(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        requests: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Apply a batchUpdate to a spreadsheet. OSS no-op."""
+        return None
+
+    async def google_sheets_get_sheet_id(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        sheet_title: str,
+    ) -> int | None:
+        """Resolve a tab title to its numeric sheetId. OSS no-op."""
+        return None
+
+    async def google_sheets_get_grid_properties(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        sheet_title: str,
+    ) -> Any | None:
+        """Return the named tab's grid dimensions (sheet_id, column_count, row_count). OSS no-op."""
+        return None
+
+    async def google_sheets_get_grid_properties_by_id(
+        self,
+        *,
+        access_token: str,
+        spreadsheet_id: str,
+        sheet_id: int,
+    ) -> Any | None:
+        """Return grid dimensions for a sheet matched by numeric sheetId. OSS no-op."""
+        return None
+
     async def generate_async_operations(
         self,
         organization: Organization,
@@ -564,7 +938,7 @@ class AgentFunction:
     ) -> CleanupElementTreeFunc:
         MAX_ELEMENT_CNT = settings.SVG_MAX_PARSING_ELEMENT_CNT
 
-        @traced()
+        @traced(name="skyvern.agent.cleanup_element_tree")
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
             """
             Remove rect and attribute.unique_id from the elements.
@@ -591,9 +965,7 @@ class AgentFunction:
 
                 element_cnt += 1
                 if element_cnt == MAX_ELEMENT_CNT:
-                    LOG.warning(
-                        f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element."
-                    )
+                    LOG.debug(f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element.")
                 disable_conversion = element_cnt > MAX_ELEMENT_CNT
                 if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None or not settings.ENABLE_CSS_SVG_PARSING:
                     disable_conversion = True
@@ -698,6 +1070,10 @@ class AgentFunction:
         OSS returns empty string (no hardening).
         """
         return ""
+
+    def get_copilot_config(self) -> CopilotConfig | None:
+        """Return an optional workflow copilot config override."""
+        return None
 
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.

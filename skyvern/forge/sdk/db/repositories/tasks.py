@@ -17,6 +17,7 @@ from skyvern.forge.sdk.db.models import (
     StepModel,
     TaskModel,
     TaskRunModel,
+    WorkflowRunBlockModel,
     WorkflowRunModel,
 )
 from skyvern.forge.sdk.db.utils import convert_to_step, convert_to_task, hydrate_action, serialize_proxy_location
@@ -56,6 +57,7 @@ class TasksRepository(BaseRepository):
         retry: int | None = None,
         max_steps_per_run: int | None = None,
         error_code_mapping: dict[str, str] | None = None,
+        workflow_system_prompt: str | None = None,
         task_type: str = TaskType.general,
         application: str | None = None,
         include_action_history_in_verification: bool | None = None,
@@ -78,6 +80,7 @@ class TasksRepository(BaseRepository):
         url = sanitize_postgres_text(url)
         complete_criterion = _sanitize(complete_criterion)
         terminate_criterion = _sanitize(terminate_criterion)
+        workflow_system_prompt = _sanitize(workflow_system_prompt)
 
         async with self.Session() as session:
             new_task = TaskModel(
@@ -101,6 +104,7 @@ class TasksRepository(BaseRepository):
                 retry=retry,
                 max_steps_per_run=max_steps_per_run,
                 error_code_mapping=error_code_mapping,
+                workflow_system_prompt=workflow_system_prompt,
                 application=application,
                 include_action_history_in_verification=include_action_history_in_verification,
                 model=model,
@@ -227,6 +231,56 @@ class TasksRepository(BaseRepository):
             )
             row = (await session.execute(query)).one()
             return row.total, row.completed
+
+    @db_operation("get_step_cost_sum_by_task_ids")
+    async def get_step_cost_sum_by_task_ids(self, task_ids: list[str], organization_id: str) -> float:
+        """Sum `step_cost` across all steps belonging to the given task_ids.
+
+        Returns 0.0 for empty task_ids. Includes failed steps.
+        """
+        if not task_ids:
+            return 0.0
+        async with self.Session() as session:
+            query = (
+                select(func.coalesce(func.sum(StepModel.step_cost), 0))
+                .where(StepModel.task_id.in_(task_ids))
+                .where(StepModel.organization_id == organization_id)
+            )
+            total = (await session.execute(query)).scalar_one()
+            return float(total)
+
+    @db_operation("get_workflow_run_progress_timestamps")
+    async def get_workflow_run_progress_timestamps(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> tuple[datetime | None, datetime | None]:
+        """Return ``(max(step.modified_at), max(workflow_run_block.modified_at))``
+        for a given workflow run. Both values are scalar aggregates — no row
+        hydration — and are designed for the copilot watchdog poll path where
+        the only question is "has anything changed since the last poll?".
+
+        Step updates are the per-LLM-call heartbeat (status transitions plus
+        incremental token/cost accumulators — every ``update_step`` call bumps
+        ``StepModel.modified_at``). Block updates cover non-task block types
+        (CODE, TEXT_PROMPT) that never create a task row. Together the two
+        aggregates cover every kind of block the copilot can run.
+        """
+        async with self.Session() as session:
+            step_stmt = (
+                select(func.max(StepModel.modified_at))
+                .join(TaskModel, StepModel.task_id == TaskModel.task_id)
+                .where(TaskModel.workflow_run_id == workflow_run_id)
+                .where(StepModel.organization_id == organization_id)
+            )
+            block_stmt = (
+                select(func.max(WorkflowRunBlockModel.modified_at))
+                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+            )
+            step_ts = (await session.execute(step_stmt)).scalar_one_or_none()
+            block_ts = (await session.execute(block_stmt)).scalar_one_or_none()
+            return step_ts, block_ts
 
     @db_operation("get_total_unique_step_order_count_by_task_ids")
     async def get_total_unique_step_order_count_by_task_ids(
@@ -611,6 +665,40 @@ class TasksRepository(BaseRepository):
                 update_stmt = update(TaskModel).where(TaskModel.task_id.in_(task_ids)).values(**update_values)
                 await session.execute(update_stmt)
                 await session.commit()
+
+    @db_operation("bulk_update_tasks_by_workflow_run_ids")
+    async def bulk_update_tasks_by_workflow_run_ids(
+        self,
+        workflow_run_ids: list[str],
+        new_status: TaskStatus,
+        only_if_status_in: list[TaskStatus],
+        failure_reason: str | None = None,
+    ) -> int:
+        """Cascade-update child tasks of the given workflow_runs.
+
+        The standalone-task cleanup cron skips rows with workflow_run_id set;
+        this method sweeps their children when a parent is finalized. Stamps
+        ``finished_at`` via COALESCE on terminal transitions. Returns row count.
+        """
+        if not workflow_run_ids or not only_if_status_in:
+            return 0
+
+        async with self.Session() as session:
+            update_values: dict[str, Any] = {"status": new_status.value}
+            if new_status.is_final():
+                update_values["finished_at"] = func.coalesce(TaskModel.finished_at, datetime.now(timezone.utc))
+            if failure_reason is not None:
+                update_values["failure_reason"] = failure_reason
+
+            update_stmt = (
+                update(TaskModel)
+                .where(TaskModel.workflow_run_id.in_(workflow_run_ids))
+                .where(TaskModel.status.in_([s.value for s in only_if_status_in]))
+                .values(**update_values)
+            )
+            result = await session.execute(update_stmt)
+            await session.commit()
+            return result.rowcount or 0
 
     @db_operation("get_tasks")
     async def get_tasks(

@@ -63,6 +63,7 @@ export const ProxyLocation = {
   ResidentialNL: "RESIDENTIAL_NL",
   ResidentialPH: "RESIDENTIAL_PH",
   ResidentialKR: "RESIDENTIAL_KR",
+  ResidentialSA: "RESIDENTIAL_SA",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -146,6 +147,12 @@ export type Task = {
   application: string | null;
 };
 
+export type FailureCategory = {
+  category: string;
+  confidence_float: number;
+  reasoning: string;
+};
+
 export type TaskApiResponse = {
   request: CreateTaskRequest;
   task_id: string;
@@ -156,6 +163,7 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   errors: Array<Record<string, unknown>>;
   max_steps_per_run: number | null;
@@ -197,6 +205,11 @@ export type OrganizationApiResponse = {
   modified_at: string;
   max_retries_per_step: number | null;
   max_steps_per_run: number | null;
+  // Optional because the field is added in a backend image rollout; until
+  // every API host has the new schema this property may be absent from the
+  // response payload.
+  max_steps_per_workflow_run?: number | null;
+  artifact_url_expiry_seconds?: number | null;
   organization_id: string;
   organization_name: string;
   webhook_callback_url: string | null;
@@ -252,6 +265,95 @@ export interface CreateAzureClientSecretCredentialRequest {
 
 export interface AzureClientSecretCredentialResponse {
   token: AzureOrganizationAuthToken;
+}
+
+export interface GoogleOAuthCredential {
+  id: string;
+  organization_id: string;
+  credential_name: string;
+  scopes: string | null;
+  valid: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface GoogleOAuthCredentialResponse {
+  credential: GoogleOAuthCredential;
+  app_origin?: string | null;
+}
+
+export interface GoogleOAuthCredentialListResponse {
+  credentials: GoogleOAuthCredential[];
+}
+
+export interface CreateGoogleOAuthAuthorizeRequest {
+  redirect_uri: string;
+  credential_name?: string;
+  app_origin?: string;
+}
+
+export interface GoogleOAuthAuthorizeResponse {
+  authorize_url: string;
+  state: string;
+}
+
+export interface CreateGoogleOAuthCallbackRequest {
+  code: string;
+  state: string;
+}
+
+export interface GoogleSpreadsheetSummary {
+  id: string;
+  name: string;
+  modified_time: string | null;
+  web_view_link: string | null;
+}
+
+export interface PagedGoogleSpreadsheets {
+  spreadsheets: GoogleSpreadsheetSummary[];
+  next_page_token: string | null;
+}
+
+export interface GoogleSheetTab {
+  sheet_id: number;
+  title: string;
+  index: number;
+}
+
+export interface ListGoogleSheetTabsResponse {
+  tabs: GoogleSheetTab[];
+}
+
+export interface SheetHeader {
+  letter: string;
+  name: string;
+}
+
+export interface GetSheetHeadersResponse {
+  headers: SheetHeader[];
+}
+
+export interface GetSheetDimensionsResponse {
+  sheet_id: number;
+  title: string;
+  column_count: number;
+  row_count: number;
+  last_column_letter: string;
+  headers: SheetHeader[];
+}
+
+export interface CreateGoogleSpreadsheetResponse {
+  spreadsheet: GoogleSpreadsheetSummary;
+  first_sheet_name: string | null;
+}
+
+export interface CreateGoogleSheetTabResponse {
+  tab: GoogleSheetTab;
+}
+
+export interface GoogleSheetsReconnectRequiredError {
+  code: "reconnect_required";
+  missing_scope: string | null;
 }
 
 export interface BitwardenCredential {
@@ -462,6 +564,7 @@ export type TaskRunListItem = {
   finished_at: string | null;
   created_at: string;
   workflow_permanent_id: string | null;
+  workflow_deleted: boolean;
   script_run: boolean;
   searchable_text: string | null;
 };
@@ -480,8 +583,10 @@ export type WorkflowRunStatusApiResponse = {
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
+  recording_urls: Array<string> | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
@@ -489,6 +594,7 @@ export type WorkflowRunStatusApiResponse = {
   task_v2: TaskV2 | null;
   workflow_title: string | null;
   browser_session_id: string | null;
+  browser_profile_id: string | null;
   max_screenshot_scrolls: number | null;
   run_with: string | null;
   waiting_for_verification_code?: boolean;
@@ -510,8 +616,10 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
+  recording_urls: Array<string> | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
@@ -519,6 +627,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   task_v2: TaskV2 | null;
   workflow_title: string | null;
   browser_session_id: string | null;
+  browser_profile_id: string | null;
   max_screenshot_scrolls: number | null;
   run_with: string | null;
   workflow: WorkflowApiResponse;
@@ -579,6 +688,17 @@ export type Createv2TaskRequest = {
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
   browser_session_id?: string | null;
+};
+
+export type BrowserProfileApiResponse = {
+  browser_profile_id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  source_browser_type: string | null;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
 };
 
 export type PasswordCredentialApiResponse = {

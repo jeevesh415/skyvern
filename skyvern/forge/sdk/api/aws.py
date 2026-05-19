@@ -1,20 +1,24 @@
+from __future__ import annotations
+
 import io
 import time
 from enum import StrEnum
 from mimetypes import add_type, guess_type
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import aioboto3
 import structlog
 from botocore.exceptions import ClientError
-from types_boto3_batch.client import BatchClient
-from types_boto3_ec2.client import EC2Client
-from types_boto3_ecs.client import ECSClient
-from types_boto3_s3.client import S3Client
-from types_boto3_secretsmanager.client import SecretsManagerClient
 
 from skyvern.config import settings
+
+if TYPE_CHECKING:
+    from types_boto3_batch.client import BatchClient
+    from types_boto3_ec2.client import EC2Client
+    from types_boto3_ecs.client import ECSClient
+    from types_boto3_s3.client import S3Client
+    from types_boto3_secretsmanager.client import SecretsManagerClient
 
 # Register custom mime types for mimetypes guessing
 add_type("application/json", ".har")
@@ -296,7 +300,7 @@ class AsyncAWSClient:
                 LOG.exception("S3 download failed", uri=uri)
             return None
 
-    async def delete_file(self, uri: str, log_exception: bool = True) -> None:
+    async def delete_file(self, uri: str, log_exception: bool = True, raise_on_error: bool = False) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html
         async def _op() -> None:
             async with self._s3_client() as client:
@@ -308,6 +312,8 @@ class AsyncAWSClient:
         except Exception:
             if log_exception:
                 LOG.exception("S3 delete failed", uri=uri)
+            if raise_on_error:
+                raise
 
     async def get_object_info(self, uri: str) -> dict:
         async def _op() -> dict:

@@ -1,6 +1,6 @@
 import os
 import shutil
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -227,6 +227,29 @@ class LocalStorage(BaseStorage):
             return None
         return str(stored_folder_path)
 
+    async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to delete browser session outside storage base path",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return
+        if not stored_folder_path.exists():
+            return
+        try:
+            shutil.rmtree(stored_folder_path)
+        except Exception:
+            LOG.exception(
+                "Failed to delete local browser session",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                path=str(stored_folder_path),
+            )
+            raise
+
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile locally."""
         stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
@@ -291,8 +314,10 @@ class LocalStorage(BaseStorage):
     ) -> list[str]:
         return []
 
-    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
-        """List all recording files for a browser session from local storage.
+    async def get_shared_recordings_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        """Get recording files with URLs for a browser session from local storage.
 
         Videos are synced to the browser_sessions storage path when the session closes.
         """
@@ -305,20 +330,14 @@ class LocalStorage(BaseStorage):
             / "videos"
         )
 
-        recording_files: list[str] = []
-        if videos_base.exists():
-            for root, _, files in os.walk(videos_base):
-                for file in files:
-                    file_path = Path(root) / file
-                    recording_files.append(f"file://{file_path}")
+        if not videos_base.exists():
+            return []
 
-        return recording_files
+        file_uris: list[str] = []
+        for root, _, files in os.walk(videos_base):
+            for file in files:
+                file_uris.append(f"file://{Path(root) / file}")
 
-    async def get_shared_recordings_in_browser_session(
-        self, organization_id: str, browser_session_id: str
-    ) -> list[FileInfo]:
-        """Get recording files with URLs for a browser session from local storage."""
-        file_uris = await self.list_recordings_in_browser_session(organization_id, browser_session_id)
         if not file_uris:
             return []
 
@@ -340,11 +359,18 @@ class LocalStorage(BaseStorage):
             if not path_obj.exists():
                 continue
 
-            file_size = path_obj.stat().st_size
+            try:
+                stat_result = path_obj.stat()
+            except OSError:
+                LOG.warning("Failed to stat local recording file", path=file_path, exc_info=True)
+                continue
+            file_size = stat_result.st_size
             if file_size == 0:
                 continue
 
-            modified_at = datetime.fromtimestamp(path_obj.stat().st_mtime)
+            # Return UTC-aware so consumers can safely compare against S3 LastModified
+            # (also UTC-aware) without hitting naive-vs-aware TypeErrors.
+            modified_at = datetime.fromtimestamp(stat_result.st_mtime, tz=UTC)
             checksum = calculate_sha256_for_file(file_path)
             filename = path_obj.name
 
@@ -352,6 +378,7 @@ class LocalStorage(BaseStorage):
                 url=uri,
                 checksum=checksum,
                 filename=filename,
+                file_size=file_size,
                 modified_at=modified_at,
             )
             file_infos.append(file_info)
@@ -366,9 +393,18 @@ class LocalStorage(BaseStorage):
         for file_or_folder in files_and_folders:
             path = os.path.join(download_dir, file_or_folder)
             if os.path.isfile(path):
-                # Calculate checksum for the file
                 checksum = calculate_sha256_for_file(path)
-                file_info = FileInfo(url=f"file://{path}", checksum=checksum, filename=file_or_folder)
+                try:
+                    file_size = os.path.getsize(path)
+                except OSError:
+                    LOG.warning("Failed to get local downloaded file size", path=path, exc_info=True)
+                    file_size = None
+                file_info = FileInfo(
+                    url=f"file://{path}",
+                    checksum=checksum,
+                    filename=file_or_folder,
+                    file_size=file_size,
+                )
                 file_infos.append(file_info)
         return file_infos
 

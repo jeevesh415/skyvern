@@ -1,7 +1,14 @@
-import { DiscordLogoIcon } from "@radix-ui/react-icons";
-import GitHubButton from "react-github-btn";
+import {
+  DiscordLogoIcon,
+  GitHubLogoIcon,
+  StarIcon,
+} from "@radix-ui/react-icons";
 import { Link, useMatch, useSearchParams } from "react-router-dom";
 import { NavigationHamburgerMenu } from "./NavigationHamburgerMenu";
+import {
+  starCountFormatter,
+  useGithubStarCount,
+} from "@/hooks/useGithubStarCount";
 
 function Header() {
   const [searchParams] = useSearchParams();
@@ -11,6 +18,8 @@ function Header() {
     location.pathname.includes("build") ||
     location.pathname.includes("debug") ||
     embed === "true";
+
+  const { data: starCount } = useGithubStarCount({ enabled: !match });
 
   if (match) {
     return null;
@@ -28,17 +37,21 @@ function Header() {
           >
             <DiscordLogoIcon className="h-7 w-7" />
           </Link>
-          <div className="h-7">
-            <GitHubButton
-              href="https://github.com/skyvern-ai/skyvern"
-              data-color-scheme="no-preference: dark; light: dark; dark: dark;"
-              data-size="large"
-              data-show-count="true"
-              aria-label="Star skyvern-ai/skyvern on GitHub"
-            >
-              Star
-            </GitHubButton>
-          </div>
+          <Link
+            to="https://github.com/skyvern-ai/skyvern"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Star skyvern-ai/skyvern on GitHub"
+            className="flex items-center gap-1"
+          >
+            <GitHubLogoIcon className="h-7 w-7" />
+            <StarIcon className="h-5 w-5" />
+            {typeof starCount === "number" ? (
+              <span className="text-sm tabular-nums">
+                {starCountFormatter.format(starCount)}
+              </span>
+            ) : null}
+          </Link>
         </div>
       </div>
     </header>

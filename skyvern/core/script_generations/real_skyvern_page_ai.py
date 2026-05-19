@@ -11,7 +11,8 @@ from playwright.async_api import Page
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
-from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
+from skyvern.core.script_generations.skyvern_page_ai import SYSTEM_PROMPT_UNSET, SkyvernPageAi
+from skyvern.exceptions import WorkflowRunContextNotInitialized
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
@@ -132,9 +133,9 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
         if template in template_data:
             return template_data[template]
 
-    # Inject for_loop metadata (current_value, current_index, current_item) so
-    # that cached function bodies inside for_loops can resolve {{ current_value }}
-    # in page.goto() and other template-rendered calls.
+    # Inject loop metadata from script `skyvern.loop()` / `skyvern.while_loop()`
+    # (current_value, current_index, current_item) so cached function bodies inside
+    # loops can resolve templates. while_loop yields null current_value; index is set.
     if context and context.loop_metadata:
         for key in ("current_value", "current_index", "current_item"):
             if key in context.loop_metadata:
@@ -168,6 +169,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         failed_selector: str | None = None,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> str | None:
         """Click an element using AI to locate it based on intention.
 
@@ -235,6 +237,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     intention=intention,
                     action=action,
                     block_label=block_label,
+                    recoverable_marker_id=recoverable_marker_id,
                 )
 
                 return selector
@@ -262,6 +265,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         failed_selector: str | None = None,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
 
@@ -385,6 +389,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 intention=intention,
                 action=action,
                 block_label=block_label,
+                recoverable_marker_id=recoverable_marker_id,
             )
         else:
             locator = self.page.locator(selector)
@@ -589,6 +594,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
         """
         current_url = self.page.url
         result = "UNKNOWN"
+        # Defaults so the meta write below is always safe — the LLM-exception
+        # path skips the assignments inside the try block, but UNKNOWN can
+        # still be returned and the metadata fields must be defined.
+        reasoning: str = ""
+        confidence: float = 0.0
+        extracted_text_for_meta: str = ""
 
         # Tier 0: URL pattern matching (FREE)
         if url_patterns:
@@ -603,7 +614,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         )
                         result = key
                         await self._record_branch_hit(result)
-                        self._store_classify_result(result)
+                        self._store_classify_result(
+                            result,
+                            current_url=current_url,
+                            options=options,
+                            block_label=self.current_label,
+                        )
                         return result
                 except re.error:
                     LOG.warning("page.classify: invalid URL regex pattern", key=key, pattern=pattern)
@@ -628,18 +644,23 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     )
                     result = key
                     await self._record_branch_hit(result)
-                    self._store_classify_result(result)
+                    self._store_classify_result(
+                        result,
+                        current_url=current_url,
+                        options=options,
+                        block_label=self.current_label,
+                    )
                     return result
 
         # Tier 2: Mini-LLM classification
         if not scraped:
             await self._refresh_scraped_page(take_screenshots=False)
-        extracted_text = (self.scraped_page.extracted_text or "")[:2000]
+        extracted_text_for_meta = (self.scraped_page.extracted_text or "")[:2000]
 
         classify_prompt = prompt_engine.load_prompt(
             template="page-classify",
             current_url=current_url,
-            extracted_text=extracted_text,
+            extracted_text=extracted_text_for_meta,
             options=options,
         )
 
@@ -679,7 +700,15 @@ class RealSkyvernPageAi(SkyvernPageAi):
             result = "UNKNOWN"
 
         await self._record_branch_hit(result)
-        self._store_classify_result(result)
+        self._store_classify_result(
+            result,
+            current_url=current_url,
+            options=options,
+            block_label=self.current_label,
+            rejection_reasoning=reasoning,
+            confidence=confidence,
+            text_excerpt=extracted_text_for_meta,
+        )
         return result
 
     async def _record_element_fallback_episode(
@@ -690,28 +719,32 @@ class RealSkyvernPageAi(SkyvernPageAi):
         intention: str,
         action: Any,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> None:
         """Record an element-level fallback episode when ai_click/ai_input_text fires
         because a CSS selector failed or was missing. Gated on code_version >= 2.
 
-        This gives the script reviewer the signal AND the action data (css_suggestion,
-        element attributes) it needs to write a proper selector for the next script version.
+        Two trigger conditions:
+        - `failed_selector` set → fallback path: a tried selector missed.
+        - `recoverable_marker_id` set → SKY-9436 escape hatch: generator emitted
+          `ai='proactive'` because no semantic selector existed at codegen.
+          AI succeeded; capture the element pick so the reviewer can later
+          upgrade the call to `selector=, ai='fallback'`.
         """
-        if failed_selector is None:
-            # None means the caller didn't pass failed_selector — this is a direct
-            # ai_click call (not from the ai='fallback' path), so don't record.
+        if failed_selector is None and recoverable_marker_id is None:
             return
         if (context.code_version or 0) < 2:
             return
         if not context.workflow_run_id or not context.workflow_permanent_id:
             return
         try:
-            # Build agent_actions data for the reviewer
             action_data: dict[str, Any] = {
                 "action_type": action_type,
                 "intention": intention,
                 "failed_selector": failed_selector if failed_selector else "(missing — no selector= argument)",
             }
+            if recoverable_marker_id is not None:
+                action_data["recoverable_marker_id"] = recoverable_marker_id
             if hasattr(action, "element_id"):
                 action_data["element_id"] = action.element_id
             if hasattr(action, "skyvern_element_data") and action.skyvern_element_data:
@@ -751,12 +784,19 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if hasattr(action, "reasoning"):
                 action_data["reasoning"] = action.reasoning
 
-            error_msg = (
-                f"Selector {'failed' if failed_selector else 'missing'} on page.{action_type}(), "
-                f"AI fallback succeeded. "
-                f"Original selector: {failed_selector or '(none)'}. "
-                f"Intention: {intention}"
-            )
+            if recoverable_marker_id is not None and failed_selector is None:
+                error_msg = (
+                    f"Proactive recovery on page.{action_type}() (marker={recoverable_marker_id}): "
+                    f"generator emitted ai='proactive' (no semantic selector at codegen); "
+                    f"AI picked the element. Intention: {intention}"
+                )
+            else:
+                error_msg = (
+                    f"Selector {'failed' if failed_selector else 'missing'} on page.{action_type}(), "
+                    f"AI fallback succeeded. "
+                    f"Original selector: {failed_selector or '(none)'}. "
+                    f"Intention: {intention}"
+                )
             await app.DATABASE.scripts.create_fallback_episode(
                 organization_id=context.organization_id or "",
                 workflow_permanent_id=context.workflow_permanent_id,
@@ -778,14 +818,36 @@ class RealSkyvernPageAi(SkyvernPageAi):
             LOG.warning("Failed to record element fallback episode for selector failure", exc_info=True)
 
     @staticmethod
-    def _store_classify_result(result: str) -> None:
-        """Store the classify result on SkyvernContext for fallback episode recording."""
+    def _store_classify_result(
+        result: str,
+        *,
+        current_url: str,
+        options: dict[str, str],
+        block_label: str | None,
+        rejection_reasoning: str = "",
+        confidence: float = 0.0,
+        text_excerpt: str = "",
+    ) -> None:
+        """Store classify result + (on UNKNOWN) rejection metadata for the next element_fallback to consume."""
         try:
             ctx = skyvern_context.current()
-            if ctx:
-                ctx.last_classify_result = result
+            if ctx is None:
+                return
+            ctx.last_classify_result = result
+            if result == "UNKNOWN":
+                ctx.last_classify_meta = {
+                    "result": "UNKNOWN",
+                    "url_at_classify": current_url,
+                    "block_label_at_classify": block_label,
+                    "candidate_options": dict(options),
+                    "rejection_reasoning": rejection_reasoning,
+                    "confidence": confidence,
+                    "text_excerpt": (text_excerpt or "")[:500],
+                }
+            else:
+                ctx.last_classify_meta = None
         except Exception:
-            pass
+            LOG.debug("_store_classify_result: failed to persist classify meta", exc_info=True)
 
     async def _record_branch_hit(self, branch_key: str) -> None:
         """Best-effort recording of a classify branch hit for TTL tracking."""
@@ -806,17 +868,28 @@ class RealSkyvernPageAi(SkyvernPageAi):
     async def ai_element_fallback(
         self,
         navigation_goal: str,
-        max_steps: int = 10,
+        max_steps: int = 5,
+        validate_first: bool = False,
     ) -> None:
-        """Activate the AI agent from the CURRENT page position to achieve a navigation goal.
+        """Drive an AI agent from the current page state toward ``navigation_goal``.
 
-        Uses repeated ai_act calls with ai_validate checks to execute from the
-        current page state. Records all actions taken for later review by the
-        AI Script Reviewer.
+        Records one fallback episode per invocation regardless of exit path; pops
+        any preceding classify metadata at entry so subsequent fallbacks cannot
+        inherit it.
+
+        ``validate_first=True`` re-enables the legacy pre-act validate on
+        iteration 0 for defensive callers that may invoke this when the page
+        already satisfies the goal; the default (False) skips that validate
+        because the documented call site (classify-UNKNOWN / selector-failure
+        fallback) cannot be on the success state.
         """
         context = skyvern_context.current()
         if not context or not context.organization_id:
             raise Exception("element_fallback requires an active context with organization_id")
+
+        # Consume-at-entry — exception-safe pop.
+        classify_meta: dict[str, Any] | None = context.last_classify_meta
+        context.last_classify_meta = None
 
         LOG.info(
             "page.element_fallback: starting from current page",
@@ -826,7 +899,6 @@ class RealSkyvernPageAi(SkyvernPageAi):
             workflow_run_id=context.workflow_run_id,
         )
 
-        # Capture page state before element fallback for episode recording
         page_url_at_entry = self.page.url
         page_text_at_entry: str | None = None
         try:
@@ -836,55 +908,79 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         steps_taken: list[dict] = []
         completed = False
+        exception_summary: str | None = None
+        captured_exception: BaseException | None = None
 
-        for step_num in range(max_steps):
-            # Check if the goal has been achieved
-            is_complete = await self.ai_validate(
-                prompt=f"Has the following goal been achieved? Goal: {navigation_goal}",
-            )
-            if is_complete:
+        try:
+            for step_num in range(max_steps):
+                # Skip iteration-0 validate; opt in via validate_first for defensive callers.
+                if step_num > 0 or validate_first:
+                    is_complete = await self.ai_validate(
+                        prompt=f"Has the following goal been achieved? Goal: {navigation_goal}",
+                    )
+                    if is_complete:
+                        LOG.info(
+                            "page.element_fallback: goal achieved",
+                            step_num=step_num,
+                            navigation_goal=navigation_goal,
+                        )
+                        completed = True
+                        break
+
                 LOG.info(
-                    "page.element_fallback: goal achieved",
+                    "page.element_fallback: executing step",
                     step_num=step_num,
-                    navigation_goal=navigation_goal,
+                    current_url=self.page.url,
                 )
-                completed = True
-                break
 
-            LOG.info(
-                "page.element_fallback: executing step",
-                step_num=step_num,
-                current_url=self.page.url,
+                context.current_step_actions = []
+                url_before = self.page.url
+                try:
+                    await self.ai_act(
+                        prompt=f"Take the next action to achieve this goal: {navigation_goal}",
+                    )
+                    actions_this_step = list(context.current_step_actions or [])
+                finally:
+                    context.current_step_actions = None
+                steps_taken.append(
+                    {
+                        "step": step_num,
+                        "url_before": url_before,
+                        "url_after": self.page.url,
+                        "actions": actions_this_step[:10],
+                    }
+                )
+            else:
+                # All max_steps acts ran without an early break — final validate
+                # so max_steps=1 can succeed when the lone act completed the goal.
+                if max_steps > 0:
+                    is_complete = await self.ai_validate(
+                        prompt=f"Has the following goal been achieved? Goal: {navigation_goal}",
+                    )
+                    if is_complete:
+                        LOG.info(
+                            "page.element_fallback: goal achieved",
+                            step_num=max_steps,
+                            navigation_goal=navigation_goal,
+                        )
+                        completed = True
+        except Exception as exc:
+            exception_summary = f"{type(exc).__name__}: {exc!s}"[:500]
+            captured_exception = exc
+        finally:
+            await self._persist_classify_unknown_episode(
+                context=context,
+                classify_meta=classify_meta,
+                page_url_at_entry=page_url_at_entry,
+                page_text_at_entry=page_text_at_entry,
+                steps_taken=steps_taken,
+                navigation_goal=navigation_goal,
+                completed=completed,
+                exception_summary=exception_summary,
             )
 
-            # Let the AI agent take an action toward the goal
-            await self.ai_act(
-                prompt=f"Take the next action to achieve this goal: {navigation_goal}",
-            )
-            steps_taken.append({"step": step_num, "url_after": self.page.url})
-
-        # Record an element fallback episode for the feedback loop
-        if context.workflow_run_id and context.workflow_permanent_id:
-            try:
-                await app.DATABASE.scripts.create_fallback_episode(
-                    organization_id=context.organization_id,
-                    workflow_permanent_id=context.workflow_permanent_id,
-                    workflow_run_id=context.workflow_run_id,
-                    block_label=self.current_label or "unknown",
-                    fallback_type="element",
-                    script_revision_id=context.script_revision_id,
-                    error_message=f"classify returned UNKNOWN, element_fallback goal: {navigation_goal}",
-                    page_url=page_url_at_entry,
-                    page_text_snapshot=page_text_at_entry,
-                    agent_actions={
-                        "navigation_goal": navigation_goal,
-                        "completed": completed,
-                        "steps_taken": len(steps_taken),
-                        "steps": steps_taken[:20],
-                    },
-                )
-            except Exception:
-                LOG.debug("Failed to record element fallback episode", exc_info=True)
+        if captured_exception is not None:
+            raise captured_exception
 
         if not completed:
             LOG.warning(
@@ -893,6 +989,80 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 navigation_goal=navigation_goal,
             )
             raise Exception(f"Element fallback did not complete within {max_steps} steps")
+
+    async def _persist_classify_unknown_episode(
+        self,
+        *,
+        context: skyvern_context.SkyvernContext,
+        classify_meta: dict[str, Any] | None,
+        page_url_at_entry: str,
+        page_text_at_entry: str | None,
+        steps_taken: list[dict],
+        navigation_goal: str,
+        completed: bool,
+        exception_summary: str | None,
+    ) -> None:
+        """Record the fallback episode; attach classify_meta only on (URL, block_label) match."""
+        if not (context.organization_id and context.workflow_run_id and context.workflow_permanent_id):
+            LOG.debug("Skipping fallback episode: missing context identifiers")
+            return
+
+        # Single narrow: ``meta`` is the trustworthy classify metadata or None.
+        # Carries the URL+block_label predecessor invariant.
+        meta: dict[str, Any] | None = None
+        if (
+            classify_meta is not None
+            and classify_meta.get("url_at_classify") == page_url_at_entry
+            and classify_meta.get("block_label_at_classify") == self.current_label
+        ):
+            meta = classify_meta
+
+        classify_result_for_episode: str | None = meta.get("result") if meta is not None else None
+
+        # Flat ``actions`` matches the reviewer template iteration; ``steps`` keeps the per-iteration grouping.
+        flat_actions: list[dict[str, Any]] = []
+        for step in steps_taken:
+            for act in step.get("actions") or []:
+                flat_actions.append(act)
+        agent_actions_payload: dict[str, Any] = {
+            "navigation_goal": navigation_goal,
+            "completed": completed,
+            "steps_taken": len(steps_taken),
+            "actions": flat_actions[:20],
+            "steps": steps_taken[:20],
+        }
+        if exception_summary is not None:
+            agent_actions_payload["exception_summary"] = exception_summary
+        if meta is not None and meta.get("result") == "UNKNOWN":
+            agent_actions_payload["classify_rejection"] = {
+                "reasoning": meta.get("rejection_reasoning"),
+                "confidence": meta.get("confidence"),
+                "candidate_options": meta.get("candidate_options"),
+                "text_excerpt": meta.get("text_excerpt"),
+            }
+
+        error_message = (
+            f"classify returned UNKNOWN, element_fallback goal: {navigation_goal}"
+            if classify_result_for_episode == "UNKNOWN"
+            else f"element_fallback goal: {navigation_goal}"
+        )
+
+        try:
+            await app.DATABASE.scripts.create_fallback_episode(
+                organization_id=context.organization_id,
+                workflow_permanent_id=context.workflow_permanent_id,
+                workflow_run_id=context.workflow_run_id,
+                block_label=self.current_label or "unknown",
+                fallback_type="element",
+                script_revision_id=context.script_revision_id,
+                error_message=error_message,
+                classify_result=classify_result_for_episode,
+                page_url=page_url_at_entry,
+                page_text_snapshot=page_text_at_entry,
+                agent_actions=agent_actions_payload,
+            )
+        except Exception:
+            LOG.debug("Failed to record element fallback episode", exc_info=True)
 
     async def ai_extract(
         self,
@@ -903,6 +1073,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         data: str | dict[str, Any] | None = None,
         skip_refresh: bool = False,
         include_extracted_text: bool = True,
+        system_prompt: str | None | Any = SYSTEM_PROMPT_UNSET,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
 
@@ -914,6 +1085,42 @@ class RealSkyvernPageAi(SkyvernPageAi):
             tz_info = context.tz_info
         prompt = _render_template_with_label(prompt, label=self.current_label)
         local_datetime_str = datetime.now(tz_info).isoformat()
+
+        # Resolve the effective workflow_system_prompt for this run. Order:
+        #   1. Caller-passed value wins (including None — "block opted out,
+        #      send no system prompt").
+        #   2. Block-recorded value from ``WorkflowRunContext``, populated by
+        #      ``Block._apply_workflow_system_prompt`` in both the agent path
+        #      (``format_potential_template_parameters``) and the script path
+        #      (``_execute_single_block`` before ``exec``). Using the recorded
+        #      value makes the block the single source of truth for the
+        #      opt-out + resolved-string decision — script-path extractions
+        #      hash to the same cache key and send the same LLM input the
+        #      agent path would. A recorded ``None`` is a real opt-out, not a
+        #      miss (SKY-9147).
+        #   3. Fall back to the run-wide effective prompt for non-block
+        #      callers (standalone scripts, sdk routes, etc.) that never set
+        #      ``current_label`` and never went through a Block.
+        workflow_system_prompt: str | None
+        if system_prompt is not SYSTEM_PROMPT_UNSET:
+            workflow_system_prompt = cast("str | None", system_prompt)
+        else:
+            workflow_system_prompt = None
+            workflow_run_context_for_prompt = None
+            if context and context.workflow_run_id:
+                try:
+                    workflow_run_context_for_prompt = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
+                        context.workflow_run_id
+                    )
+                except WorkflowRunContextNotInitialized:
+                    workflow_run_context_for_prompt = None
+
+            if workflow_run_context_for_prompt is not None:
+                recorded, value = workflow_run_context_for_prompt.get_block_workflow_system_prompt(self.current_label)
+                if recorded:
+                    workflow_system_prompt = value
+                else:
+                    workflow_system_prompt = workflow_run_context_for_prompt.resolve_effective_workflow_system_prompt()
 
         # Render the prompt FIRST so the cache key hashes the exact string
         # that will be sent to the LLM (captures economy-tree swaps and 2/3
@@ -981,7 +1188,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 extracted_information_schema=post_ceiling_kwargs["extracted_information_schema"],
                 error_code_mapping=error_code_mapping_str,
                 llm_key=None,
-                local_datetime=local_datetime_str,
+                workflow_system_prompt=workflow_system_prompt,
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:
@@ -1043,6 +1250,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             screenshots=self.scraped_page.screenshots,
             prompt_name="extract-information",
             force_dict=False,
+            system_prompt=workflow_system_prompt,
         )
 
         # Validate and fill missing fields based on schema
@@ -1063,17 +1271,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 LOG.warning("ai_extract cache store failed; ignoring", exc_info=True)
 
         if context and context.script_mode:
-            print(f"\n✨ 📊 Extracted Information:\n{'-' * 50}")
-
-            try:
-                # Pretty print JSON if result is a dict/list
-                if isinstance(result, (dict, list)):
-                    print(json.dumps(result, indent=2, ensure_ascii=False))
-                else:
-                    print(result)
-            except Exception:
-                print(result)
-            print(f"{'-' * 50}\n")
+            LOG.debug("Extracted information", result=result)
         return result
 
     async def ai_validate(
@@ -1332,6 +1530,58 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     prompt=prompt,
                 )
                 return
+
+            # ``current_step_actions`` is None outside element_fallback frames; field names match the reviewer template.
+            if context.current_step_actions is not None:
+                # ai_act treats ``result is None or empty`` as success (no
+                # exception raised below). Label "failed" only when there's
+                # positive evidence of failure — otherwise "success" — to
+                # match the existing ``if result and result[-1].success is
+                # False: raise`` semantics two lines below.
+                action_failed = bool(result) and result[-1].success is False
+                action_record: dict[str, Any] = {
+                    "action_type": action_type,
+                    "intention": getattr(action, "intention", None),
+                    "reasoning": getattr(action, "reasoning", None),
+                    "page_url": self.page.url,
+                    "status": "failed" if action_failed else "success",
+                }
+                el_data = getattr(action, "skyvern_element_data", None)
+                if el_data:
+                    action_record["element_text"] = (el_data.get("text") or "")[:200]
+                    action_record["element_tag"] = el_data.get("tagName", "")
+                    sel_options = compute_selector_options(el_data)
+                    if sel_options:
+                        action_record["selector_options"] = sel_options
+                        action_record["css_suggestion"] = sel_options[0][0]
+                    el_attrs = el_data.get("attributes") or {}
+                    if el_attrs:
+                        action_record["all_attributes"] = {
+                            k: v
+                            for k, v in el_attrs.items()
+                            if k
+                            in (
+                                "id",
+                                "name",
+                                "class",
+                                "aria-label",
+                                "placeholder",
+                                "type",
+                                "role",
+                                "data-testid",
+                                "href",
+                                "value",
+                                "title",
+                            )
+                        }
+                if hasattr(action, "get_xpath"):
+                    try:
+                        xpath = action.get_xpath()
+                    except Exception:
+                        xpath = None
+                    if xpath:
+                        action_record["xpath"] = xpath
+                context.current_step_actions.append(action_record)
 
             if result and result[-1].success is False:
                 raise Exception(result[-1].exception_message)

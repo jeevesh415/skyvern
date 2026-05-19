@@ -7,11 +7,13 @@ Generate a runnable Skyvern workflow script.
 from __future__ import annotations
 
 import hashlib
+import json
 import keyword
 import re
+import zlib
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import libcst as cst
 import structlog
@@ -19,12 +21,26 @@ from libcst import Attribute, Call, Dict, DictElement, FunctionDef, Name, Param
 
 from skyvern.config import settings
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS, SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION
+from skyvern.core.script_generations.deterministic_field_naming import (
+    infer_credential_subscript_for_emit,
+    pick_credential_root_for_block,
+)
 from skyvern.core.script_generations.generate_workflow_parameters import (
     CUSTOM_FIELD_ACTIONS,
     generate_workflow_parameters_schema,
     hydrate_input_text_actions_with_field_names,
 )
+from skyvern.core.script_generations.parameter_reference_guard import (
+    HallucinatedParameterError,
+    log_or_raise_guard_result,
+    validate_context_parameter_refs,
+)
+from skyvern.core.script_generations.script_validators import validate_missing_selectors
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow.models.parameter import (
+    WorkflowParameterType,
+    is_sensitive_workflow_parameter,
+)
 from skyvern.schemas.workflows import FileStorageType
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.webeye.actions.action_types import ActionType
@@ -54,6 +70,148 @@ class CodeGenResult:
     blocks_failed: int
 
 
+# ----- SKY-8965: valid-keys collection for the parameter-reference guard --------
+
+# `\s+` tolerates any indentation a future formatter might pick; `[^=]+?` for
+# the type annotation captures complex types like `Optional[str]` and `list[str]`
+# without silently dropping those fields from the valid-keys set.
+_SCHEMA_FIELD_RE = re.compile(r"^\s+(\w+)\s*:\s*[^=]+?=\s*Field\(", re.MULTILINE)
+
+
+def _collect_declared_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
+    """Return the set of all parameter keys from the workflow definition.
+
+    Includes workflow, output, and context parameters — any parameter type whose
+    key can legally appear as `context.parameters['key']` at runtime. Secret
+    parameter types (aws_secret, bitwarden_*, etc.) are included too since their
+    presence in the valid-keys set only reduces false-positive guard violations.
+    """
+    keys: set[str] = set()
+    defn = workflow.get("workflow_definition") or {}
+    if not isinstance(defn, dict):
+        return frozenset()
+    for param in defn.get("parameters") or []:
+        if not isinstance(param, dict):
+            continue
+        key = param.get("key")
+        if key:
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _collect_secret_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
+    """Return the set of parameter keys that carry credential/secret data.
+
+    Routes each declared parameter through ``is_sensitive_workflow_parameter`` —
+    the canonical filter that combines ``ParameterType.is_secret_or_credential``
+    (aws_secret, bitwarden_*, onepassword, azure_*, credential) with the
+    ``workflow_parameter_type=credential_id`` sub-check. Used by
+    ``_build_value_to_param_lookup`` to skip emitting ``context.parameters[key]``
+    references that would leak secret indirection into persisted prompts.
+    """
+    keys: set[str] = set()
+    defn = workflow.get("workflow_definition") or {}
+    if not isinstance(defn, dict):
+        return frozenset()
+    for param in defn.get("parameters") or []:
+        if not isinstance(param, dict):
+            continue
+        key = param.get("key")
+        if key and is_sensitive_workflow_parameter(param):
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _collect_credential_param_keys(workflow: dict[str, Any]) -> frozenset[str]:
+    """Parameter keys typed `WorkflowParameterType.CREDENTIAL_ID`.
+
+    Narrower than `_collect_secret_param_keys`: only params whose runtime
+    value is a `{username, password, totp}` dict expanded by `setup()`.
+    """
+    target_enum = WorkflowParameterType.CREDENTIAL_ID
+    target_str = target_enum.value
+    keys: set[str] = set()
+    defn = workflow.get("workflow_definition") or {}
+    if not isinstance(defn, dict):
+        return frozenset()
+    for param in defn.get("parameters") or []:
+        if not isinstance(param, dict):
+            continue
+        key = param.get("key")
+        if not key:
+            continue
+        # Workflow definitions can carry the type as the enum object (when
+        # constructed live) or its string value (when round-tripped via JSON).
+        param_type = param.get("workflow_parameter_type")
+        if param_type == target_enum or param_type == target_str:
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _collect_upstream_schema_keys(blocks: list[dict[str, Any]]) -> frozenset[str]:
+    """Return the set of keys introduced by upstream blocks' data_schema.
+
+    Extracts `properties` keys from any block's `data_schema` (extract-info
+    blocks and task blocks with a `data_extraction_goal`). Handles both dict
+    schemas and JSON-encoded string schemas (BlockYAML allows either). Recurses
+    into ForLoop children (`loop_blocks`) since extract-info nested inside a
+    loop still contributes keys referenced by the generated script.
+
+    Phase 1 treats these as globally valid (a reference to `invoice_date` is OK
+    anywhere in the script, not just blocks that come after the block that
+    declares it). Phase 2 may tighten this to per-block ordering.
+    """
+    keys: set[str] = set()
+    for block in blocks or []:
+        schema = block.get("data_schema")
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except (ValueError, TypeError):
+                schema = None
+        if isinstance(schema, dict):
+            props = schema.get("properties")
+            if isinstance(props, dict):
+                keys.update(str(k) for k in props.keys())
+        nested = block.get("loop_blocks")
+        if isinstance(nested, list):
+            keys |= _collect_upstream_schema_keys(nested)
+    return frozenset(keys)
+
+
+def _collect_goal_templates(blocks: list[dict[str, Any]]) -> dict[str, str]:
+    """Map each task_id to its unrendered navigation_goal template.
+
+    The deterministic picker uses these templates to detect jinja references
+    like ``{{ search_term }}`` and bind actions to declared parameters.
+
+    Recurses into ``loop_blocks`` so tasks nested inside ForLoops also get
+    Rule-1 context (CORR-3 from debate review).
+    """
+    result: dict[str, str] = {}
+    for block in blocks or []:
+        task_id = block.get("task_id")
+        if task_id:
+            goal = block.get("navigation_goal") or block.get("data_extraction_goal") or ""
+            if goal:
+                result[task_id] = goal
+        nested = block.get("loop_blocks")
+        if isinstance(nested, list):
+            result.update(_collect_goal_templates(nested))
+    return result
+
+
+def _collect_synthesized_field_keys(schema_code: str) -> frozenset[str]:
+    """Extract field names from a generated `GeneratedWorkflowParameters` class.
+
+    Parses the schema code by regex for the `name: type = Field(...)` pattern.
+    Returns an empty frozenset for the empty-schema case (`pass` body).
+    """
+    if not schema_code:
+        return frozenset()
+    return frozenset(_SCHEMA_FIELD_RE.findall(schema_code))
+
+
 def _build_existing_field_assignments(
     blocks: list[dict[str, Any]],
     actions_by_task: dict[str, list[dict[str, Any]]],
@@ -75,15 +233,26 @@ def _build_existing_field_assignments(
     Returns:
         Dictionary mapping action index (1-based) to the existing field name that must be preserved
     """
-    # Build mapping of block label -> task_id
+    # Build mapping of block label -> task_id, recursing into loop_blocks so
+    # cached child blocks inside ForLoops are also covered. Without this,
+    # Phase 1-era LLM names in cached ForLoop children would not get
+    # re-registered and the Phase 2 guard would false-positive on regen
+    # (andrewneilson review feedback).
     block_label_to_task_id: dict[str, str] = {}
-    for idx, block in enumerate(blocks):
-        if block.get("block_type") not in SCRIPT_TASK_BLOCKS:
-            continue
-        label = block.get("label") or block.get("title") or block.get("task_id") or f"task_{idx}"
-        task_id = block.get("task_id")
-        if task_id:
-            block_label_to_task_id[label] = task_id
+
+    def _collect_block_label_to_task_id(blks: list[dict[str, Any]], counter: int = 0) -> None:
+        for block in blks:
+            if block.get("block_type") in SCRIPT_TASK_BLOCKS:
+                label = block.get("label") or block.get("title") or block.get("task_id") or f"task_{counter}"
+                task_id = block.get("task_id")
+                if task_id:
+                    block_label_to_task_id[label] = task_id
+            nested = block.get("loop_blocks")
+            if isinstance(nested, list):
+                _collect_block_label_to_task_id(nested, counter + 1)
+            counter += 1
+
+    _collect_block_label_to_task_id(blocks)
 
     # Build mapping of task_id -> list of existing field names (for unchanged blocks)
     task_id_to_existing_fields: dict[str, list[str]] = {}
@@ -190,6 +359,9 @@ ACTIONS_WITH_XPATH = [
     "upload_file",
     "select_option",
 ]
+# Methods whose runtime threads `recoverable_marker_id` to the recorder.
+# Markers emitted on other methods would be dead — the recovery loop can never match them.
+RECOVERABLE_MARKER_METHODS = frozenset({"click", "fill", "type"})
 
 
 def _build_semantic_selector(act: dict[str, Any]) -> str | None:
@@ -243,9 +415,17 @@ DOUBLE_INDENT = " " * 8
 # Short values (e.g. "1", "No", "CA") cause too many false-positive replacements.
 MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 4
 
+# Maximum length. Prevents oversized values (multi-KB JSON payloads, long blobs)
+# from being scanned against every prompt; values longer than this would never
+# legitimately appear verbatim in a click prompt anyway.
+MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 500
+
 
 def _build_value_to_param_lookup(
     actions_by_task: dict[str, list[dict[str, Any]]],
+    workflow_parameters: dict[str, Any] | None = None,
+    declared_keys: frozenset[str] | None = None,
+    secret_param_keys: frozenset[str] | None = None,
 ) -> dict[str, str]:
     """Build a mapping from literal action values to their parameter field names.
 
@@ -255,10 +435,30 @@ def _build_value_to_param_lookup(
     that click-prompt generation can replace matching literals with
     ``context.parameters['field_name']`` f-string references.
 
-    The returned dict is sorted by *descending value length* so that callers who
-    iterate in order will replace longer matches first, avoiding partial collisions.
+    When ``workflow_parameters`` is provided (the run's workflow-level input params),
+    its values are also added to the lookup keyed by the parameter name. This catches
+    run-specific values that the agent embedded directly in click prompts (e.g.
+    ``"Should I download the invoice for account 51410020?"`` where ``51410020``
+    came from the ``account_number`` parameter, not from an input_text action).
+
+    ``secret_param_keys`` (sourced from ``ParameterType.is_secret_or_credential`` and
+    ``WorkflowParameterType.is_credential_type``) filters out credential/secret param
+    keys structurally — substituting ``context.parameters['password']`` into a click
+    prompt would leak the indirection. ``declared_keys`` restricts emitted keys to
+    those declared in the workflow definition; an undeclared key would crash the
+    cached script at runtime when ``context.parameters[...]`` raises ``KeyError``.
+
+    First-writer-wins on duplicate values: action-level field_names are added first
+    (more specific — tied to a page interaction); workflow-param keys only fill gaps.
+    The rare case of two distinct keys legitimately sharing one value silently picks
+    the first writer; downstream reviewer flow re-validates and can correct if the
+    pick is wrong.
+
+    The returned dict is sorted by *descending value length* so callers who iterate
+    in order replace longer matches first, avoiding partial collisions.
     """
     raw: dict[str, str] = {}
+
     for _task_id, actions in actions_by_task.items():
         for action in actions:
             field_name = action.get("field_name")
@@ -273,11 +473,36 @@ def _build_value_to_param_lookup(
                 value = action.get("option", "")
             else:
                 continue
-            if value and len(value) >= MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB:
-                # First writer wins — the field-level name is more specific than a
-                # workflow-level parameter that may happen to share the same value.
-                if value not in raw:
-                    raw[value] = field_name
+            if not value:
+                continue
+            if len(value) < MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB or len(value) > MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB:
+                continue
+            if value.startswith("cred_"):
+                continue
+            raw.setdefault(value, field_name)
+
+    if workflow_parameters:
+        for param_key, param_value in workflow_parameters.items():
+            # Distinguish "no value" (None / empty string) from legitimate falsy
+            # values that could appear verbatim in a click prompt — e.g. a
+            # boolean param ``auto_renew=False`` referenced in a prompt like
+            # ``"Confirm auto-renew is False"``. ``0`` is still skipped by the
+            # min-length floor below (``str(0)`` is 1 char).
+            if param_value is None or param_value == "":
+                continue
+            if secret_param_keys and param_key in secret_param_keys:
+                continue
+            if declared_keys is not None and param_key not in declared_keys:
+                continue
+            value_str = str(param_value)
+            if (
+                len(value_str) < MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB
+                or len(value_str) > MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB
+            ):
+                continue
+            if value_str.startswith("cred_"):
+                continue
+            raw.setdefault(value_str, param_key)
 
     # Sort by descending value length so longer matches are attempted first.
     return dict(sorted(raw.items(), key=lambda kv: len(kv[0]), reverse=True))
@@ -619,6 +844,9 @@ def _action_to_stmt(
     assign_to_output: bool = False,
     value_to_param: dict[str, str] | None = None,
     use_semantic_selectors: bool = False,
+    block_type: str | None = None,
+    goal_template: str = "",
+    credential_param_keys: frozenset[str] = frozenset(),
 ) -> cst.BaseStatement:
     """
     Turn one Action dict into:
@@ -632,10 +860,17 @@ def _action_to_stmt(
     When *value_to_param* is provided, click prompt strings that contain literal
     parameter values will be emitted as f-strings referencing
     ``context.parameters['field_name']`` instead of hardcoded text.
+
+    For ``page.fill``/``page.type`` inside a login block, credential fields are
+    detected via ``infer_credential_subscript_for_emit`` and emitted as nested
+    ``context.parameters[<root>][<sub>]``. Default args preserve existing
+    behavior at every call site that doesn't thread the credential context.
     """
     method = ACTION_MAP[act["action_type"]]
 
     args: list[cst.Arg] = []
+    selector_emitted = False
+    recoverable_marker_id: int | None = None
     if method in ACTIONS_WITH_XPATH:
         if use_semantic_selectors:
             semantic = _build_semantic_selector(act)
@@ -650,7 +885,26 @@ def _action_to_stmt(
                         ),
                     )
                 )
-            # If no semantic selector, skip selector arg — ai with prompt= handles it
+                selector_emitted = True
+            # No semantic selector — caller downgrades to ai='proactive' so the
+            # runtime never sees selectorless ai='fallback' (which crashes with
+            # `selector: expected string, got undefined`). The marker_id is the
+            # stable join key so a future recovery loop can later upgrade this
+            # call back to fallback+selector once the AI's element pick is
+            # captured at runtime.
+            elif method in RECOVERABLE_MARKER_METHODS:
+                # crc32 is process-stable (built-in hash() is salted); action_id
+                # disambiguates duplicate xpath+intention pairs within a block;
+                # 31-bit mask keeps the value within PG signed INTEGER range.
+                # Both intention and reasoning are concatenated (not OR'd) so the marker
+                # stays stable if a regen flips which field is populated.
+                marker_seed = (
+                    f"{act.get('xpath', '')}|"
+                    f"{act.get('intention') or ''}|"
+                    f"{act.get('reasoning') or ''}|"
+                    f"{act.get('action_id', '')}"
+                )
+                recoverable_marker_id = (zlib.crc32(marker_seed.encode("utf-8")) & 0x7FFFFFFF) or 1
         else:
             args.append(
                 cst.Arg(
@@ -662,11 +916,11 @@ def _action_to_stmt(
                     ),
                 )
             )
+            selector_emitted = True
 
     if method == "click":
         if use_semantic_selectors:
-            # With semantic selectors, try selector first, AI only if miss
-            ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+            ai_mode = GENERATE_CODE_AI_MODE_FALLBACK if selector_emitted else GENERATE_CODE_AI_MODE_PROACTIVE
         else:
             ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
             click_context = act.get("click_context")
@@ -696,38 +950,56 @@ def _action_to_stmt(
                 )
             )
     elif method in ["type", "fill"]:
-        # Use context.parameters if field_name is available, otherwise fallback to direct value
-        if act.get("field_name"):
-            # Check if this is a multi-field TOTP sequence that needs digit indexing
-            totp_info = act.get("totp_timing_info") or {}
-            if totp_info.get("is_totp_sequence") and "action_index" in totp_info:
-                # Generate: await page.get_totp_digit(context, 'field_name', digit_index)
-                # This method properly resolves the TOTP code from credentials and returns the specific digit
-                text_value = cst.Await(
-                    expression=cst.Call(
-                        func=cst.Attribute(
-                            value=cst.Name("page"),
-                            attr=cst.Name("get_totp_digit"),
-                        ),
-                        args=[
-                            cst.Arg(value=cst.Name("context")),
-                            cst.Arg(value=_value(act["field_name"])),
-                            cst.Arg(value=_value(totp_info["action_index"])),
-                        ],
-                    )
+        # Dispatch: TOTP sequence → credential subscript → flat field_name → literal.
+        # Credential subscript intentionally precedes field_name — the picker has no
+        # concept of nested credentials and assigns a flat name even for credential
+        # fields, so the emitter overrides it when a credential pick fires.
+        totp_info = act.get("totp_timing_info") or {}
+        if act.get("field_name") and totp_info.get("is_totp_sequence") and "action_index" in totp_info:
+            text_value = cst.Await(
+                expression=cst.Call(
+                    func=cst.Attribute(
+                        value=cst.Name("page"),
+                        attr=cst.Name("get_totp_digit"),
+                    ),
+                    args=[
+                        cst.Arg(value=cst.Name("context")),
+                        cst.Arg(value=_value(act["field_name"])),
+                        cst.Arg(value=_value(totp_info["action_index"])),
+                    ],
                 )
-            else:
-                text_value = cst.Subscript(
+            )
+        elif (
+            cred_pick := infer_credential_subscript_for_emit(
+                action=act,
+                goal_template=goal_template,
+                block_type=block_type,
+                credential_param_keys=credential_param_keys,
+            )
+        ) is not None:
+            cred_root, cred_sub = cred_pick
+            text_value = cst.Subscript(
+                value=cst.Subscript(
                     value=cst.Attribute(
                         value=cst.Name("context"),
                         attr=cst.Name("parameters"),
                     ),
-                    slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
-                )
+                    slice=[cst.SubscriptElement(slice=cst.Index(value=_value(cred_root)))],
+                ),
+                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(cred_sub)))],
+            )
+        elif act.get("field_name"):
+            text_value = cst.Subscript(
+                value=cst.Attribute(
+                    value=cst.Name("context"),
+                    attr=cst.Name("parameters"),
+                ),
+                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
+            )
         else:
             text_value = _value(act["text"])
 
-        ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+        ai_mode = GENERATE_CODE_AI_MODE_FALLBACK if selector_emitted else GENERATE_CODE_AI_MODE_PROACTIVE
         if _requires_mini_agent(act):
             ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
 
@@ -763,7 +1035,38 @@ def _action_to_stmt(
                         ),
                     )
                 )
-            if task.get("totp_url"):
+            elif (
+                not task.get("totp_verification_url")
+                and not (act.get("totp_timing_info") or {}).get("is_totp_sequence")
+                and (
+                    credential_key := pick_credential_root_for_block(
+                        goal_template=goal_template,
+                        credential_param_keys=credential_param_keys,
+                    )
+                )
+            ):
+                # Mirrors BaseTaskBlock.format_potential_template_parameters: emit a
+                # runtime credential lookup so the cached script resolves the
+                # totp_identifier per run instead of hard-coding it. Skipped for
+                # is_totp_sequence — runtime poll would overwrite each single-digit
+                # input with the full code.
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_identifier"),
+                        value=cst.Call(
+                            func=cst.Attribute(
+                                value=cst.Name("context"),
+                                attr=cst.Name("credential_totp_identifier"),
+                            ),
+                            args=[cst.Arg(value=_value(credential_key))],
+                        ),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+            if task.get("totp_verification_url"):
                 args.append(
                     cst.Arg(
                         keyword=cst.Name("totp_url"),
@@ -779,6 +1082,17 @@ def _action_to_stmt(
         value = option.get("value")
         label = option.get("label")
         value = value or label
+        if not value and use_semantic_selectors and (act.get("intention") or act.get("reasoning")):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("ai"),
+                    value=_value(GENERATE_CODE_AI_MODE_PROACTIVE),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
         if value:
             # Mirror the click branch: with semantic selectors we have a real
             # CSS selector + value, so try the selector path first and fall
@@ -786,7 +1100,7 @@ def _action_to_stmt(
             # selector is an xpath harvested from iteration 0 and unlikely to
             # be reliable, so go straight to AI.
             if use_semantic_selectors:
-                ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
+                ai_mode = GENERATE_CODE_AI_MODE_FALLBACK if selector_emitted else GENERATE_CODE_AI_MODE_PROACTIVE
             else:
                 ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
             if act.get("field_name"):
@@ -964,15 +1278,35 @@ def _action_to_stmt(
         if prompt_value is None:
             prompt_value = _value(intention)
 
+        # When a marker arg follows the prompt, prompt's last_line must point
+        # at the inner indent so the marker lines up with sibling args (libcst
+        # uses the *previous* arg's last_line to position the next arg).
+        prompt_trailing = (
+            cst.ParenthesizedWhitespace(indent=True, last_line=cst.SimpleWhitespace(INDENT))
+            if recoverable_marker_id is not None
+            else cst.ParenthesizedWhitespace(indent=True)
+        )
         args.extend(
             [
                 cst.Arg(
                     keyword=cst.Name("prompt"),
                     value=prompt_value,
-                    whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
+                    whitespace_after_arg=prompt_trailing,
                     comma=cst.Comma(),
                 ),
             ]
+        )
+    if recoverable_marker_id is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("recoverable_marker_id"),
+                value=_value(recoverable_marker_id),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+                comma=cst.Comma(),
+            )
         )
     _mark_last_arg_as_comma(args)
 
@@ -1070,6 +1404,7 @@ def _build_block_fn(
     use_semantic_selectors: bool = False,
     is_in_for_loop: bool = False,
     all_blocks: list[dict[str, Any]] | None = None,
+    credential_param_keys: frozenset[str] = frozenset(),
 ) -> FunctionDef:
     # Check for platform-specific pipeline (cloud-only; returns None in OSS)
     if use_semantic_selectors:
@@ -1094,6 +1429,15 @@ def _build_block_fn(
     name = safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
+
+    # Restrict credentials to those bound to THIS block's parameters — matches
+    # BaseTaskBlock.get_all_parameters (block.py:872-883), which returns the
+    # block's own `self.parameters`. Workflow-wide keys would conflate
+    # credentials from unrelated blocks in multi-login flows.
+    block_parameter_keys: frozenset[str] = frozenset(
+        p["key"] for p in block.get("parameters") or [] if isinstance(p, dict) and isinstance(p.get("key"), str)
+    )
+    block_credential_param_keys = credential_param_keys & block_parameter_keys
 
     # Detect and annotate multi-field TOTP sequences so each fill gets the correct digit index
     actions = _annotate_multi_field_totp_sequence(actions)
@@ -1137,6 +1481,9 @@ def _build_block_fn(
                     assign_to_output=assign_to_output,
                     value_to_param=value_to_param,
                     use_semantic_selectors=use_semantic_selectors,
+                    block_type=block_type,
+                    goal_template=block.get("navigation_goal") or block.get("data_extraction_goal") or "",
+                    credential_param_keys=block_credential_param_keys,
                 )
             )
 
@@ -2388,6 +2735,87 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     return for_loop
 
 
+def _while_loop_condition_expression(block: dict[str, Any]) -> str:
+    cond = block.get("condition")
+    if isinstance(cond, dict):
+        return str(cond.get("expression") or "")
+    return ""
+
+
+def _while_loop_condition_criteria_type(block: dict[str, Any]) -> str:
+    """Discriminator for while-loop condition; must match script_service.while_loop(replay)."""
+    cond = block.get("condition")
+    if isinstance(cond, dict):
+        ct = cond.get("criteria_type")
+        if ct is None or ct == "jinja2_template":
+            return "jinja2_template"
+        if ct == "prompt":
+            return "prompt"
+        raise ValueError(
+            f"while_loop codegen: unsupported condition criteria_type {ct!r} (expected 'jinja2_template' or 'prompt')"
+        )
+    return "jinja2_template"
+
+
+def _build_while_loop_statement(block_title: str, block: dict[str, Any]) -> cst.For:
+    """Build `async for ... in skyvern.while_loop(condition=..., criteria_type=..., label=...):`."""
+    loop_blocks = block.get("loop_blocks", [])
+    body_statements = [_build_block_statement(loop_block) for loop_block in loop_blocks]
+    condition_expr = _while_loop_condition_expression(block)
+    criteria_type = _while_loop_condition_criteria_type(block)
+    while_call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("while_loop")),
+        args=[
+            cst.Arg(keyword=cst.Name("condition"), value=_value(condition_expr)),
+            cst.Arg(keyword=cst.Name("criteria_type"), value=_value(criteria_type)),
+            cst.Arg(keyword=cst.Name("label"), value=_value(block_title)),
+        ],
+    )
+    return cst.For(
+        target=cst.Name("current_value"),
+        iter=while_call,
+        body=cst.IndentedBlock(body=body_statements),
+        asynchronous=cst.Asynchronous(),
+        whitespace_after_for=cst.SimpleWhitespace(" "),
+        whitespace_before_in=cst.SimpleWhitespace(" "),
+        whitespace_after_in=cst.SimpleWhitespace(" "),
+        whitespace_before_colon=cst.SimpleWhitespace(""),
+    )
+
+
+_FOR_LOOP_CACHED_CODE_RE = re.compile(r"^async for\b.*\bin\s+skyvern\.loop\s*\(")
+_WHILE_LOOP_CACHED_CODE_RE = re.compile(r"^async for\b.*\bin\s+skyvern\.while_loop\s*\(")
+
+
+def _is_for_loop_cached_code(code: str) -> bool:
+    """Return True if *code* is a bare `async for ... in skyvern.loop(...):` block.
+
+    for_loop block_code is only valid inside the async run_workflow body — appending it
+    at module level (as the preserve-cached-blocks loop otherwise does) produces
+    'async for outside async function' SyntaxError (SKY-9180).
+    """
+    for line in code.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _FOR_LOOP_CACHED_CODE_RE.match(stripped) is not None
+    return False
+
+
+def _is_while_loop_cached_code(code: str) -> bool:
+    """True if *code* is a bare `async for ... in skyvern.while_loop(...):` (module-invalid)."""
+    for line in code.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _WHILE_LOOP_CACHED_CODE_RE.match(stripped) is not None
+    return False
+
+
+def _is_inline_only_loop_cached_code(code: str) -> bool:
+    return _is_for_loop_cached_code(code) or _is_while_loop_cached_code(code)
+
+
 def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
     if not args:
         return
@@ -2599,6 +3027,8 @@ def _build_block_statement(
         stmt = _build_wait_statement(block)
     elif block_type == "for_loop":
         stmt = _build_for_loop_statement(block_title, block)
+    elif block_type == "while_loop":
+        stmt = _build_while_loop_statement(block_title, block)
     elif block_type == "goto_url":
         stmt = _build_goto_statement(block, data_variable_name)
     elif block_type == "code":
@@ -2800,14 +3230,34 @@ async def generate_workflow_script_python_code(
         cached_blocks=cached_blocks,
         updated_block_labels=updated_block_labels,
     )
+    # SKY-8965 Phase 2: pass declared-param and upstream-schema keys so the
+    # deterministic picker can match actions to known fields instead of the
+    # LLM inventing names.
+    declared_keys = _collect_declared_param_keys(workflow)
+    upstream_keys = _collect_upstream_schema_keys(blocks)
+    secret_param_keys = _collect_secret_param_keys(workflow)
+    credential_param_keys = _collect_credential_param_keys(workflow)
+    goal_template_by_task = _collect_goal_templates(blocks)
     generated_schema, field_mappings = await generate_workflow_parameters_schema(
-        actions_by_task, existing_field_assignments
+        actions_by_task,
+        existing_field_assignments,
+        declared_param_keys=declared_keys,
+        upstream_schema_keys=upstream_keys,
+        goal_template_by_task=goal_template_by_task,
     )
     actions_by_task = hydrate_input_text_actions_with_field_names(actions_by_task, field_mappings)
 
     # Build a lookup from literal parameter values to field names so that click
     # prompt strings can be parameterized (e.g. patient ID → context.parameters[...]).
-    value_to_param = _build_value_to_param_lookup(actions_by_task)
+    # Pass the run's workflow-level input parameters too so click-prompt literals
+    # like "for account 51410020" get substituted with context.parameters[...]
+    # references at generation time, not baked in run-specifically.
+    value_to_param = _build_value_to_param_lookup(
+        actions_by_task,
+        workflow_parameters=workflow_run_request.get("parameters") if workflow_run_request else None,
+        declared_keys=declared_keys,
+        secret_param_keys=secret_param_keys,
+    )
 
     # --- class + cached params -----------------------------------------
     model_cls = _build_model(workflow)
@@ -2869,6 +3319,7 @@ async def generate_workflow_script_python_code(
                 value_to_param=value_to_param,
                 use_semantic_selectors=use_semantic_selectors,
                 all_blocks=task_v1_blocks,
+                credential_param_keys=credential_param_keys,
             )
             temp_module = cst.Module(body=[block_fn_def])
             block_code = temp_module.code
@@ -2945,6 +3396,7 @@ async def generate_workflow_script_python_code(
                         actions_by_task.get(child_block.get("task_id", ""), []),
                         value_to_param=value_to_param,
                         use_semantic_selectors=use_semantic_selectors,
+                        credential_param_keys=credential_param_keys,
                     )
                     task_v2_block_body.append(cst.EmptyLine())
                     task_v2_block_body.append(cst.EmptyLine())
@@ -2976,202 +3428,210 @@ async def generate_workflow_script_python_code(
 
         append_block_code(block_code)
 
-    # Handle for_loop blocks
-    # ForLoop blocks need script_block entries with run_signature so they can be executed via cached scripts
-    for_loop_blocks = [block for block in blocks if block["block_type"] == "for_loop"]
-    for for_loop_block in for_loop_blocks:
-        for_loop_label = for_loop_block.get("label") or f"for_loop_{for_loop_block.get('workflow_run_block_id')}"
+    # Handle for_loop and while_loop blocks
+    _SCRIPT_LOOP_BUILDERS: list[tuple[str, Callable[[str, dict[str, Any]], cst.For]]] = [
+        ("for_loop", _build_for_loop_statement),
+        ("while_loop", _build_while_loop_statement),
+    ]
+    for sl_type, build_sl_stmt in _SCRIPT_LOOP_BUILDERS:
+        sl_typed_blocks = [block for block in blocks if block["block_type"] == sl_type]
+        sl_prefix = "for_loop" if sl_type == "for_loop" else "while_loop"
+        for sl_block in sl_typed_blocks:
+            sl_label = sl_block.get("label") or f"{sl_prefix}_{sl_block.get('workflow_run_block_id')}"
 
-        cached_source = cached_blocks.get(for_loop_label)
-        use_cached = cached_source is not None and for_loop_label not in updated_block_labels
+            cached_source = cached_blocks.get(sl_label)
+            use_cached = cached_source is not None and sl_label not in updated_block_labels
 
-        block_workflow_run_id = for_loop_block.get("workflow_run_id") or run_id
-        block_workflow_run_block_id = for_loop_block.get("workflow_run_block_id")
+            block_workflow_run_id = sl_block.get("workflow_run_id") or run_id
+            block_workflow_run_block_id = sl_block.get("workflow_run_block_id")
 
-        if use_cached:
-            assert cached_source is not None
-            block_code = cached_source.code
-            run_signature = cached_source.run_signature
-            block_workflow_run_id = cached_source.workflow_run_id
-            block_workflow_run_block_id = cached_source.workflow_run_block_id
-        else:
-            # Build the for loop statement
-            for_loop_stmt = _build_for_loop_statement(for_loop_label, for_loop_block)
-            temp_module = cst.Module(body=[for_loop_stmt])
-            block_code = temp_module.code
-            run_signature = block_code.strip()
-
-        if script_id and script_revision_id and organization_id:
-            ok = await create_or_update_script_block(
-                block_code=block_code,
-                script_revision_id=script_revision_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                block_label=for_loop_label,
-                update=pending,
-                run_signature=run_signature,
-                workflow_run_id=block_workflow_run_id,
-                workflow_run_block_id=block_workflow_run_block_id,
-                input_fields=None,
-            )
-            if ok:
-                blocks_created += 1
+            if use_cached:
+                assert cached_source is not None
+                block_code = cached_source.code
+                run_signature = cached_source.run_signature
+                block_workflow_run_id = cached_source.workflow_run_id
+                block_workflow_run_block_id = cached_source.workflow_run_block_id
             else:
-                blocks_failed += 1
+                sl_stmt = build_sl_stmt(sl_label, sl_block)
+                temp_module = cst.Module(body=[sl_stmt])
+                block_code = temp_module.code
+                run_signature = block_code.strip()
 
-        # NOTE: Do NOT call append_block_code() for for_loop blocks.
-        # Unlike task blocks (which produce function definitions valid at module level),
-        # for_loop blocks produce bare `async for` statements that cause SyntaxError
-        # at module level ("async for outside async function"). The for-loop code is
-        # already correctly inlined inside run_workflow() via _build_block_statement().
-
-        # Generate cached function bodies for for_loop inner blocks.
-        # Inner blocks (e.g. extraction inside a loop) are nested in loop_blocks and
-        # are NOT in the top-level blocks list, so they need separate processing here.
-        # This follows the same pattern as task_v2 child block handling (lines 2704-2714).
-        # Uses a BFS queue to recursively handle nested for-loops (SKY-8757).
-        # Each queue entry is (block_dict, parent_forloop_label) so cache
-        # invalidation propagates from the correct parent at any depth.
-        loop_block_queue: deque[tuple[dict[str, Any], str]] = deque(
-            (lb, for_loop_label) for lb in for_loop_block.get("loop_blocks", [])
-        )
-        while loop_block_queue:
-            loop_block, parent_fl_label = loop_block_queue.popleft()
-            loop_block_type = loop_block.get("block_type")
-
-            # block_type is a string here (from dict.get on model_dump output),
-            # not a BlockType enum — unlike transform_workflow_run.py which
-            # works with ORM objects. Both compare correctly to string literals.
-            #
-            # Nested for-loop: create script_block for the inner for-loop itself,
-            # then push its children onto the queue for processing.
-            # NOTE: Do NOT call append_block_code() for nested for_loop blocks
-            # (same as top-level for_loops) — they produce bare `async for`
-            # statements that cause SyntaxError at module level.
-            if loop_block_type == "for_loop":
-                nested_label = loop_block.get("label") or f"for_loop_{loop_block.get('workflow_run_block_id')}"
-
-                cached_nested = cached_blocks.get(nested_label)
-                # Force rebuild when the nested label OR its immediate parent
-                # for-loop is marked for regeneration (invalidation propagates
-                # down at every nesting depth, not just from the top-level).
-                use_nested_cached = (
-                    cached_nested is not None
-                    and nested_label not in updated_block_labels
-                    and parent_fl_label not in updated_block_labels
-                )
-
-                nested_wrbi = loop_block.get("workflow_run_block_id")
-                nested_wri = loop_block.get("workflow_run_id") or run_id
-
-                # use_nested_cached already guarantees cached_nested is not None;
-                # the explicit check is retained only for mypy type narrowing.
-                if (
-                    use_nested_cached
-                    and cached_nested is not None
-                    and cached_nested.code
-                    and cached_nested.run_signature
-                ):
-                    nested_code = cached_nested.code
-                    nested_sig = cached_nested.run_signature
-                    nested_wrbi = cached_nested.workflow_run_block_id
-                    nested_wri = cached_nested.workflow_run_id
-                else:
-                    # No usable cache entry (missing, incomplete, or needs update)
-                    # — rebuild from current run data. Mark this label as updated
-                    # so invalidation cascades to deeper descendants.
-                    updated_block_labels.add(nested_label)
-                    nested_stmt = _build_for_loop_statement(nested_label, loop_block)
-                    temp_mod = cst.Module(body=[nested_stmt])
-                    nested_code = temp_mod.code
-                    nested_sig = nested_code.strip()
-
-                if script_id and script_revision_id and organization_id:
-                    ok = await create_or_update_script_block(
-                        block_code=nested_code,
-                        script_revision_id=script_revision_id,
-                        script_id=script_id,
-                        organization_id=organization_id,
-                        block_label=nested_label,
-                        update=pending,
-                        run_signature=nested_sig,
-                        workflow_run_id=nested_wri,
-                        workflow_run_block_id=nested_wrbi,
-                        input_fields=None,
-                    )
-                    if ok:
-                        blocks_created += 1
-                    else:
-                        blocks_failed += 1
-
-                # Push nested for-loop's children with this loop as their parent
-                loop_block_queue.extend((child, nested_label) for child in loop_block.get("loop_blocks", []))
-                continue
-
-            if loop_block_type not in SCRIPT_TASK_BLOCKS:
-                continue
-
-            inner_label = (
-                loop_block.get("label") or loop_block.get("title") or f"block_{loop_block.get('workflow_run_block_id')}"
-            )
-
-            # Check if already cached (for progressive caching)
-            cached_inner = cached_blocks.get(inner_label)
-            use_inner_cached = cached_inner is not None and inner_label not in updated_block_labels
-
-            if use_inner_cached:
-                assert cached_inner is not None
-                inner_block_code = cached_inner.code
-                inner_run_signature = cached_inner.run_signature
-                inner_wrbi = cached_inner.workflow_run_block_id
-                inner_wri = cached_inner.workflow_run_id
-            else:
-                inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
-                if not inner_actions:
-                    # No actions from agent run = can't generate cached function.
-                    # No script_block row is created; the block will be cached on
-                    # a future run when actions become available. This is intentional
-                    # — generating a stub would produce broken code.
-                    continue
-
-                inner_fn_def = _build_block_fn(
-                    loop_block,
-                    inner_actions,
-                    value_to_param=value_to_param,
-                    use_semantic_selectors=use_semantic_selectors,
-                    is_in_for_loop=True,
-                )
-                inner_block_code = cst.Module(body=[inner_fn_def]).code
-
-                inner_stmt = _build_block_statement(loop_block, value_to_param=None)
-                inner_run_signature = cst.Module(body=[inner_stmt]).code.strip()
-
-                inner_wrbi = loop_block.get("workflow_run_block_id")
-                inner_wri = loop_block.get("workflow_run_id") or run_id
-
-            # Create script_block entry for preservation across regenerations
             if script_id and script_revision_id and organization_id:
-                inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
-                if not inner_input_fields and cached_inner and cached_inner.input_fields:
-                    inner_input_fields = cached_inner.input_fields
                 ok = await create_or_update_script_block(
-                    block_code=inner_block_code,
+                    block_code=block_code,
                     script_revision_id=script_revision_id,
                     script_id=script_id,
                     organization_id=organization_id,
-                    block_label=inner_label,
+                    block_label=sl_label,
                     update=pending,
-                    run_signature=inner_run_signature,
-                    workflow_run_id=inner_wri,
-                    workflow_run_block_id=inner_wrbi,
-                    input_fields=inner_input_fields,
+                    run_signature=run_signature,
+                    workflow_run_id=block_workflow_run_id,
+                    workflow_run_block_id=block_workflow_run_block_id,
+                    input_fields=None,
                 )
                 if ok:
                     blocks_created += 1
                 else:
                     blocks_failed += 1
 
-            append_block_code(inner_block_code)
+            # NOTE: Do NOT call append_block_code() for for_loop / while_loop blocks.
+            # Unlike task blocks (which produce function definitions valid at module level),
+            # loop blocks produce bare `async for` statements that cause SyntaxError
+            # at module level ("async for outside async function"). Loop code is
+            # already correctly inlined inside run_workflow() via _build_block_statement().
+
+            # Generate cached function bodies for inner blocks nested in loop_blocks.
+            # Uses a BFS queue to recursively handle nested loops (SKY-8757).
+            loop_block_queue: deque[tuple[dict[str, Any], str]] = deque(
+                (lb, sl_label) for lb in sl_block.get("loop_blocks", [])
+            )
+            while loop_block_queue:
+                loop_block, parent_fl_label = loop_block_queue.popleft()
+                loop_block_type = loop_block.get("block_type")
+
+                # block_type is a string here (from dict.get on model_dump output),
+                # not a BlockType enum — unlike transform_workflow_run.py which
+                # works with ORM objects. Both compare correctly to string literals.
+                #
+                # Nested for-loop: create script_block for the inner for-loop itself,
+                # then push its children onto the queue for processing.
+                # NOTE: Do NOT call append_block_code() for nested for_loop blocks
+                # (same as top-level for_loops) — they produce bare `async for`
+                # statements that cause SyntaxError at module level.
+                if loop_block_type in ("for_loop", "while_loop"):
+                    nested_prefix = "for_loop" if loop_block_type == "for_loop" else "while_loop"
+                    nested_label = (
+                        loop_block.get("label") or f"{nested_prefix}_{loop_block.get('workflow_run_block_id')}"
+                    )
+                    nested_build: Callable[[str, dict[str, Any]], cst.For] = (
+                        _build_for_loop_statement if loop_block_type == "for_loop" else _build_while_loop_statement
+                    )
+
+                    cached_nested = cached_blocks.get(nested_label)
+                    # Force rebuild when the nested label OR its immediate parent
+                    # loop is marked for regeneration (invalidation propagates
+                    # down at every nesting depth, not just from the top-level).
+                    use_nested_cached = (
+                        cached_nested is not None
+                        and nested_label not in updated_block_labels
+                        and parent_fl_label not in updated_block_labels
+                    )
+
+                    nested_wrbi = loop_block.get("workflow_run_block_id")
+                    nested_wri = loop_block.get("workflow_run_id") or run_id
+
+                    # use_nested_cached already guarantees cached_nested is not None;
+                    # the explicit check is retained only for mypy type narrowing.
+                    if (
+                        use_nested_cached
+                        and cached_nested is not None
+                        and cached_nested.code
+                        and cached_nested.run_signature
+                    ):
+                        nested_code = cached_nested.code
+                        nested_sig = cached_nested.run_signature
+                        nested_wrbi = cached_nested.workflow_run_block_id
+                        nested_wri = cached_nested.workflow_run_id
+                    else:
+                        # No usable cache entry (missing, incomplete, or needs update)
+                        # — rebuild from current run data. Mark this label as updated
+                        # so invalidation cascades to deeper descendants.
+                        updated_block_labels.add(nested_label)
+                        nested_stmt = nested_build(nested_label, loop_block)
+                        temp_mod = cst.Module(body=[nested_stmt])
+                        nested_code = temp_mod.code
+                        nested_sig = nested_code.strip()
+
+                    if script_id and script_revision_id and organization_id:
+                        ok = await create_or_update_script_block(
+                            block_code=nested_code,
+                            script_revision_id=script_revision_id,
+                            script_id=script_id,
+                            organization_id=organization_id,
+                            block_label=nested_label,
+                            update=pending,
+                            run_signature=nested_sig,
+                            workflow_run_id=nested_wri,
+                            workflow_run_block_id=nested_wrbi,
+                            input_fields=None,
+                        )
+                        if ok:
+                            blocks_created += 1
+                        else:
+                            blocks_failed += 1
+
+                    # Push nested loop's children with this loop as their parent
+                    loop_block_queue.extend((child, nested_label) for child in loop_block.get("loop_blocks", []))
+                    continue
+
+                if loop_block_type not in SCRIPT_TASK_BLOCKS:
+                    continue
+
+                inner_label = (
+                    loop_block.get("label")
+                    or loop_block.get("title")
+                    or f"block_{loop_block.get('workflow_run_block_id')}"
+                )
+
+                # Check if already cached (for progressive caching)
+                cached_inner = cached_blocks.get(inner_label)
+                use_inner_cached = cached_inner is not None and inner_label not in updated_block_labels
+
+                if use_inner_cached:
+                    assert cached_inner is not None
+                    inner_block_code = cached_inner.code
+                    inner_run_signature = cached_inner.run_signature
+                    inner_wrbi = cached_inner.workflow_run_block_id
+                    inner_wri = cached_inner.workflow_run_id
+                else:
+                    inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
+                    if not inner_actions:
+                        # No actions from agent run = can't generate cached function.
+                        # No script_block row is created; the block will be cached on
+                        # a future run when actions become available. This is intentional
+                        # — generating a stub would produce broken code.
+                        continue
+
+                    inner_fn_def = _build_block_fn(
+                        loop_block,
+                        inner_actions,
+                        value_to_param=value_to_param,
+                        use_semantic_selectors=use_semantic_selectors,
+                        is_in_for_loop=True,
+                        credential_param_keys=credential_param_keys,
+                    )
+                    inner_block_code = cst.Module(body=[inner_fn_def]).code
+
+                    inner_stmt = _build_block_statement(loop_block, value_to_param=None)
+                    inner_run_signature = cst.Module(body=[inner_stmt]).code.strip()
+
+                    inner_wrbi = loop_block.get("workflow_run_block_id")
+                    inner_wri = loop_block.get("workflow_run_id") or run_id
+
+                # Create script_block entry for preservation across regenerations
+                if script_id and script_revision_id and organization_id:
+                    inner_input_fields = _collect_block_input_fields(loop_block, actions_by_task)
+                    if not inner_input_fields and cached_inner and cached_inner.input_fields:
+                        inner_input_fields = cached_inner.input_fields
+                    ok = await create_or_update_script_block(
+                        block_code=inner_block_code,
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        block_label=inner_label,
+                        update=pending,
+                        run_signature=inner_run_signature,
+                        workflow_run_id=inner_wri,
+                        workflow_run_block_id=inner_wrbi,
+                        input_fields=inner_input_fields,
+                    )
+                    if ok:
+                        blocks_created += 1
+                    else:
+                        blocks_failed += 1
+
+                append_block_code(inner_block_code)
 
     # --- agent-required blocks (adaptive caching) -----------------------
     # Structural blocks (conditional, text_prompt, wait) can't be code-generated
@@ -3238,24 +3698,25 @@ async def generate_workflow_script_python_code(
     for task_v2 in task_v2_blocks:
         label = task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}"
         processed_labels.add(label)
-    for flb in for_loop_blocks:
-        label = flb.get("label") or f"for_loop_{flb.get('workflow_run_block_id')}"
+    for slb in [b for b in blocks if b["block_type"] in ("for_loop", "while_loop")]:
+        slb_type = slb["block_type"]
+        label = slb.get("label") or (
+            f"for_loop_{slb.get('workflow_run_block_id')}"
+            if slb_type == "for_loop"
+            else f"while_loop_{slb.get('workflow_run_block_id')}"
+        )
         processed_labels.add(label)
-        # Recursively track all inner block labels (including nested for-loops)
-        # to prevent duplication in the "preserve unexecuted branch" section below.
-        # Use the same label derivation as the main code generation loop to ensure
-        # labels match (e.g., for_loop blocks without explicit labels get the
-        # "for_loop_{workflow_run_block_id}" fallback).
-        inner_queue: deque[dict[str, Any]] = deque(flb.get("loop_blocks", []))
+        inner_queue: deque[dict[str, Any]] = deque(slb.get("loop_blocks", []))
         while inner_queue:
             lb = inner_queue.popleft()
             lb_type = lb.get("block_type")
             if lb_type == "for_loop":
                 inner_lbl = lb.get("label") or f"for_loop_{lb.get('workflow_run_block_id')}"
                 inner_queue.extend(lb.get("loop_blocks", []))
+            elif lb_type == "while_loop":
+                inner_lbl = lb.get("label") or f"while_loop_{lb.get('workflow_run_block_id')}"
+                inner_queue.extend(lb.get("loop_blocks", []))
             else:
-                # Use the same 3-fallback chain as the main generation loop
-                # (label → title → block_{wrb_id}) so labels always match.
                 inner_lbl = lb.get("label") or lb.get("title") or f"block_{lb.get('workflow_run_block_id')}"
             if inner_lbl:
                 processed_labels.add(inner_lbl)
@@ -3289,6 +3750,15 @@ async def generate_workflow_script_python_code(
             else:
                 blocks_failed += 1
 
+        # SKY-9180: for_loop cached code is a bare `async for` statement, which is a
+        # SyntaxError at module level. The DB row stays (so the script_block cache
+        # entry is retained), but the code is only valid when inlined inside the
+        # async run_workflow body via _build_block_statement — which only happens
+        # for for_loops in the current run's `blocks`. Skip appending to main.py
+        # for for_loop cached code from unexecuted branches to avoid the error.
+        if _is_inline_only_loop_cached_code(cached_source.code):
+            continue
+
         append_block_code(cached_source.code)
         preserved_count += 1
 
@@ -3298,8 +3768,11 @@ async def generate_workflow_script_python_code(
             preserved_count=preserved_count,
             preserved_labels=[
                 label
-                for label in cached_blocks
-                if label not in processed_labels and cached_blocks[label].code and cached_blocks[label].run_signature
+                for label, source in cached_blocks.items()
+                if label not in processed_labels
+                and source.code
+                and source.run_signature
+                and not _is_inline_only_loop_cached_code(source.code)
             ],
         )
 
@@ -3366,7 +3839,79 @@ async def generate_workflow_script_python_code(
     ]
 
     module = cst.Module(body=module_body)
-    return CodeGenResult(source_code=module.code, blocks_created=blocks_created, blocks_failed=blocks_failed)
+    source_code = module.code
+
+    # SKY-8965 Phase 2: validate `context.parameters[X]` references against the
+    # expanded valid-keys set (declared params ∪ upstream block schema keys ∪
+    # synthesized `GeneratedWorkflowParameters` fields). Phase 2 raises on
+    # violation, preventing phantom-parameter scripts from being cached.
+    # Phase 1 (now in prod) logged warnings; 13 violations in 7 days confirmed
+    # the bug is real and low-frequency (~0.05%), safe to enforce.
+    try:
+        synthesized_keys = _collect_synthesized_field_keys(generated_schema)
+        guard_result = validate_context_parameter_refs(
+            code=source_code,
+            declared_param_keys=declared_keys,
+            upstream_schema_keys=upstream_keys,
+            synthesized_keys=synthesized_keys,
+        )
+        log_or_raise_guard_result(
+            guard_result,
+            raise_on_violation=True,
+            workflow_permanent_id=workflow.get("workflow_permanent_id"),
+            workflow_run_id=run_id,
+        )
+    except HallucinatedParameterError as hpe:
+        # Dedicated structured log so this is distinguishable from a codegen
+        # crash in Datadog. The broad except-Exception in the caller
+        # (workflow_script_service) would otherwise swallow the distinction
+        # (andrewneilson review feedback).
+        LOG.warning(
+            "parameter_reference_guard_rejected_script",
+            workflow_permanent_id=workflow.get("workflow_permanent_id"),
+            workflow_run_id=run_id,
+            undeclared_refs=sorted(r.key for r in hpe.result.undeclared_refs),
+            valid_keys=sorted(hpe.result.valid_keys),
+            sky_ticket="SKY-8965",
+        )
+        raise
+    except Exception:
+        LOG.warning("parameter_reference_guard_failed_to_run", exc_info=True)
+
+    _check_missing_selectors_and_warn(
+        source_code,
+        organization_id=organization_id,
+        workflow_permanent_id=workflow.get("workflow_permanent_id"),
+        workflow_run_id=run_id,
+    )
+
+    return CodeGenResult(source_code=source_code, blocks_created=blocks_created, blocks_failed=blocks_failed)
+
+
+def _check_missing_selectors_and_warn(
+    source_code: str,
+    *,
+    organization_id: str | None = None,
+    workflow_permanent_id: str | None,
+    workflow_run_id: str | None,
+) -> str | None:
+    # Returns the validator error string (or None) so tests can assert without
+    # capturing log output. Validator exceptions are swallowed so a parse crash
+    # never blocks codegen.
+    try:
+        selector_warning = validate_missing_selectors(source_code)
+    except Exception:
+        LOG.warning("script_generator_missing_selector_validator_failed_to_run", exc_info=True)
+        return None
+    if selector_warning:
+        LOG.warning(
+            "script_generator_emitted_selectorless_action",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            detail=selector_warning,
+        )
+    return selector_warning
 
 
 async def create_or_update_script_block(

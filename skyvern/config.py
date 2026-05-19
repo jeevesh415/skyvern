@@ -1,4 +1,5 @@
 import logging
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_DIR
-from skyvern.utils.env_paths import resolve_backend_env_path
+from skyvern.utils.env_paths import (
+    BACKEND_ENV_BASENAMES,
+    BACKEND_ENV_INTENT_ENV_VAR,
+    EnvIntent,
+    backend_env_path_candidates,
+)
 
 
 def _default_database_string() -> str:
@@ -43,10 +49,23 @@ def _ensure_sqlite_dir(database_string: str) -> None:
 # Even if we were to resolve paths at instantiation time, the global `settings`
 # singleton instantiation at the bottom of this file also runs at import time
 # and relies on the same assumption.
-_DEFAULT_ENV_FILES = (
-    resolve_backend_env_path(".env"),
-    resolve_backend_env_path(".env.staging"),
-    resolve_backend_env_path(".env.prod"),
+#
+# pydantic-settings applies later dotenv files with higher precedence, so the
+# resolver's read-priority order is reversed here. With no explicit CLI intent,
+# AUTO preserves legacy self-hosted imports by only considering ./.env.
+def _settings_env_intent() -> EnvIntent:
+    try:
+        return EnvIntent(os.getenv(BACKEND_ENV_INTENT_ENV_VAR, EnvIntent.AUTO.value))
+    except ValueError:
+        return EnvIntent.AUTO
+
+
+def _settings_env_file_candidates(basename: str) -> tuple[Path, ...]:
+    return tuple(reversed(backend_env_path_candidates(basename, intent=_settings_env_intent())))
+
+
+_DEFAULT_ENV_FILES = tuple(
+    candidate for basename in BACKEND_ENV_BASENAMES for candidate in _settings_env_file_candidates(basename)
 )
 
 
@@ -66,6 +85,8 @@ class Settings(BaseSettings):
 
     BROWSER_TYPE: str = "chromium-headful"
     BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
+    BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
+    BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
@@ -98,8 +119,10 @@ class Settings(BaseSettings):
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
-    DATABASE_POOL_SIZE: int = 5
-    DATABASE_POOL_MAX_OVERFLOW: int = 10
+    DATABASE_POOL_SIZE: int = 20
+    DATABASE_POOL_MAX_OVERFLOW: int = 20
+    DATABASE_POOL_TIMEOUT: int = 10
+    DATABASE_POOL_RECYCLE: int = 1800
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -109,6 +132,12 @@ class Settings(BaseSettings):
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
+    COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
+    # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
+    # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
+    # On = new agent-SDK path under skyvern.forge.sdk.copilot.
+    # Per-environment canary; default off until we are confident.
+    ENABLE_WORKFLOW_COPILOT_V2: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
@@ -177,6 +206,7 @@ class Settings(BaseSettings):
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
+    BROWSER_CURSOR_VISUALIZATION: bool = False
     BROWSER_MAX_PAGES_NUMBER: int = 10
     BROWSER_ADDITIONAL_ARGS: list[str] = []
 
@@ -206,7 +236,7 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4O"  # This is the model name
+    LLM_KEY: str = "OPENAI_GPT5_5"  # This is the model name
     LLM_API_KEY: str | None = None  # API key for the model
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
@@ -222,6 +252,8 @@ class Settings(BaseSettings):
     SCRIPT_GENERATION_LLM_KEY: str | None = None
     SCRIPT_REVIEWER_LLM_KEY: str | None = None
     ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_AGENT_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_FAST_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -243,9 +275,10 @@ class Settings(BaseSettings):
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
+    OPENAI_CUA_MODEL: str = "computer-use-preview"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
-    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
+    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -513,6 +546,32 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+    ENABLE_ENCRYPTION: bool = False
+
+    # Google OAuth settings (used by the Google Sheets connector)
+    GOOGLE_OAUTH_CLIENT_ID: str | None = None
+    GOOGLE_OAUTH_CLIENT_SECRET: str | None = None
+    # Hostnames allowed as the OAuth ``redirect_uri`` sent to Google. Defense-in-depth
+    # alongside Google's own redirect_uri allowlist (which is the real enforcement
+    # gate — it validates the full URI against its registered list). This setting is
+    # intentionally host-only: any path or port on an approved host passes. Empty
+    # list means no redirect_uri may be supplied at all (the route layer rejects
+    # with 400) when CLIENT_ID is set.
+    GOOGLE_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    # Origins allowed as the bounce-back destination after OAuth callback.
+    # Never sent to Google. Two entry shapes — port handling differs:
+    #   - Exact-match: ``https://host:port`` matches that exact origin (port included).
+    #     ``https://app.example.com`` does NOT match ``https://app.example.com:8443``.
+    #   - Suffix wildcard: ``*.foo.com`` matches any HTTPS hostname ending in ``.foo.com``
+    #     regardless of port (so preview deploys on non-default ports work). Rejects
+    #     bare-suffix spoofs like ``attacker-foo.com``.
+    # Fails closed: an empty list rejects every app_origin, so self-hosted operators
+    # who want to use the bounce-back flow must populate this with at least one entry.
+    GOOGLE_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
+
+    # Google Sheets API runtime tuning
+    GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0
+    GOOGLE_SHEETS_API_MAX_RETRIES: int = 3
 
     # Cleanup Cron Settings
     ENABLE_CLEANUP_CRON: bool = False
@@ -672,7 +731,7 @@ class Settings(BaseSettings):
 
     def execute_all_steps(self) -> bool:
         """
-        This provides the functionality to execute steps one by one through the Streamlit UI.
+        This provides the functionality to execute steps one by one through the local UI.
         ***Value is always True if ENV is not local.***
 
         :return: True if env is not local, else the value of EXECUTE_ALL_STEPS

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import time
 import urllib.parse
 import uuid
@@ -11,19 +12,22 @@ from typing import Any, Awaitable, Callable, List
 
 import pyotp
 import structlog
+from fuzzysearch import find_near_matches
+from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Response, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.config import settings
 from skyvern.constants import (
     AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
     BROWSER_DOWNLOAD_MAX_WAIT_TIME,
+    BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME,
     BROWSER_DOWNLOAD_TIMEOUT,
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
 )
-from skyvern.errors.errors import TOTPExpiredError
+from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
@@ -54,12 +58,12 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
     OptionIndexOutOfBound,
-    WrongElementToUploadFile,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
+    calculate_sha256_for_file,
     check_downloading_files_and_wait_for_download_to_complete,
     get_download_dir,
     list_files_in_directory,
@@ -69,6 +73,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
@@ -76,9 +81,11 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.utils.lean_html import apply_lean_to_tree
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
     CheckPhoneNumberFormatResponse,
@@ -101,11 +108,16 @@ from skyvern.webeye.actions.actions import (
     SelectOption,
     SelectOptionAction,
     UploadFileAction,
-    UserDefinedError,
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import initialize_download_dir
+from skyvern.webeye.cdp_download_interceptor import (
+    DOWNLOAD_MIME_TYPES,
+    MAX_FILE_SIZE_BYTES,
+    extract_filename,
+    is_download_response,
+)
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -118,6 +130,152 @@ from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElem
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
+DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
+
+
+def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
+    filename = Path(suggested_filename or "download").name
+    stem, suffix = os.path.splitext(filename)
+    return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
+
+
+def _remove_download_listener(page: Page, callback: Callable[[Download], None]) -> None:
+    off = getattr(page, "off", None)
+    if callable(off):
+        off("download", callback)
+        return
+
+    remove_listener = getattr(page, "remove_listener", None)
+    if callable(remove_listener):
+        remove_listener("download", callback)
+        return
+
+    LOG.warning("Page does not support removing download listeners")
+
+
+def _canonical_download_duplicate_stem(stem: str) -> str:
+    """Return a stem with common browser duplicate suffixes removed."""
+    return DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE.sub("", stem)
+
+
+def _has_download_duplicate_suffix(stem: str) -> bool:
+    """Return whether a stem carries a browser duplicate suffix."""
+    return _canonical_download_duplicate_stem(stem) != stem
+
+
+def _is_empty_duplicate_download_placeholder(file_path: str, non_empty_file_paths: set[str]) -> bool:
+    """Return whether a 0-byte local file is a duplicate-name placeholder.
+
+    Empty exports can be valid artifacts, so only remove a 0-byte file when a
+    file carrying a browser duplicate suffix has the same extension and
+    canonical stem as a non-empty local file, such as ``report_1.pdf`` next to
+    ``report.pdf``.
+    """
+    file_dir = os.path.dirname(file_path)
+    file_stem, file_suffix = os.path.splitext(os.path.basename(file_path))
+    if not _has_download_duplicate_suffix(file_stem):
+        return False
+
+    file_canonical_stem = _canonical_download_duplicate_stem(file_stem)
+
+    for non_empty_file_path in non_empty_file_paths:
+        if os.path.dirname(non_empty_file_path) != file_dir:
+            continue
+
+        non_empty_stem, non_empty_suffix = os.path.splitext(os.path.basename(non_empty_file_path))
+        if non_empty_suffix != file_suffix:
+            continue
+
+        non_empty_canonical_stem = _canonical_download_duplicate_stem(non_empty_stem)
+        if file_stem != non_empty_stem and file_canonical_stem == non_empty_canonical_stem:
+            return True
+
+    return False
+
+
+def _deduplicate_new_downloaded_file_paths(
+    new_file_paths: set[str],
+    workflow_run_id: str | None,
+    observed_file_paths: set[str] | None = None,
+) -> list[str]:
+    """Filter junk local downloads and remove checksum duplicates.
+
+    Remote browser-session URIs are returned untouched because the action
+    process cannot hash or delete them locally. Local 0-byte files are removed
+    only when they look like duplicate-name placeholders for a non-empty file
+    observed in the run directory.
+    """
+    non_empty_file_paths: set[str] = set()
+    for fp in observed_file_paths or new_file_paths:
+        if not os.path.isfile(fp):
+            continue
+        try:
+            if os.path.getsize(fp) > 0:
+                non_empty_file_paths.add(fp)
+        except OSError:
+            continue
+
+    seen_checksums: dict[str, str] = {}
+    deduplicated_paths: list[str] = []
+    for fp in sorted(new_file_paths):
+        if not os.path.isfile(fp):
+            deduplicated_paths.append(fp)
+            continue
+
+        try:
+            file_size = os.path.getsize(fp)
+            if file_size == 0:
+                if _is_empty_duplicate_download_placeholder(fp, non_empty_file_paths):
+                    LOG.warning(
+                        "Removing 0-byte duplicate downloaded file placeholder",
+                        file=os.path.basename(fp),
+                        workflow_run_id=workflow_run_id,
+                    )
+                    os.remove(fp)
+                else:
+                    deduplicated_paths.append(fp)
+                continue
+            checksum = calculate_sha256_for_file(fp)
+        except OSError:
+            LOG.warning(
+                "Downloaded file disappeared before deduplication",
+                file=os.path.basename(fp),
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            continue
+
+        if checksum in seen_checksums:
+            LOG.info(
+                "Removing duplicate downloaded file from single action",
+                file=os.path.basename(fp),
+                duplicate_of=os.path.basename(seen_checksums[checksum]),
+                checksum=checksum,
+            )
+            os.remove(fp)
+        else:
+            seen_checksums[checksum] = fp
+            deduplicated_paths.append(fp)
+    return deduplicated_paths
+
+
+async def _screenshot_without_cursor(page: Page, **kwargs: Any) -> bytes:
+    """Take a screenshot with cursor overlay hidden so it doesn't interfere with LLM analysis."""
+    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+        try:
+            await SkyvernFrame.hide_cursor_overlay(page)
+        except Exception:
+            pass
+        try:
+            return await page.screenshot(**kwargs)
+        finally:
+            try:
+                await SkyvernFrame.show_cursor_overlay(page)
+            except Exception:
+                pass
+    return await page.screenshot(**kwargs)
 
 
 class CustomSingleSelectResult:
@@ -350,6 +508,105 @@ class AutoCompletionResult(BaseModel):
     action_result: ActionResult = ActionSuccess()
 
 
+class ScopedXhrDownloadCapture:
+    """Install on a page before a download action; remove after the polling window.
+
+    Skipped when CDPDownloadInterceptor is active on the browser context
+    (detected via ``_skyvern_cdp_download_active`` flag) because the CDP path
+    already handles downloads at the Fetch domain level.
+
+    Automatically attaches to new pages opened during the action window
+    (e.g. target="_blank" links) so XHR responses on child tabs are captured.
+    """
+
+    def __init__(self, page: Page, download_dir: Path) -> None:
+        self._page = page
+        self._download_dir = download_dir
+        self._saved: set[str] = set()
+        self._extra_pages: list[Page] = []
+        self._active = False
+
+    def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
+        """Check if an XHR response carries a downloadable file body.
+
+        Reuses ``is_download_response`` for attachment cases. For inline
+        responses, additionally accepts download MIME + explicit filename
+        (the case ``is_download_response`` intentionally rejects for the
+        global CDP path to avoid false positives on PDF previews).
+        """
+        if is_download_response(headers, status, resource_type="XHR"):
+            return True
+        if status >= 400:
+            return False
+        content_type = headers.get("content-type", "").split(";")[0].strip().lower()
+        content_disposition = headers.get("content-disposition", "")
+        if content_type not in DOWNLOAD_MIME_TYPES:
+            return False
+        return bool(re.search(r"filename\s*[*]?\s*=", content_disposition, re.IGNORECASE))
+
+    async def _on_response(self, response: Response) -> None:
+        try:
+            if response.request.resource_type not in ("xhr", "fetch"):
+                return
+            headers = response.headers
+            if not self._is_xhr_download(headers, response.status):
+                return
+            raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
+            filename = Path(raw_filename).name if raw_filename else ""
+            if not filename or filename in self._saved:
+                return
+            content_length = headers.get("content-length", "")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_FILE_SIZE_BYTES:
+                        return
+                except ValueError:
+                    pass
+            save_path = self._download_dir / filename
+            body = await response.body()
+            if len(body) > MAX_FILE_SIZE_BYTES:
+                return
+            try:
+                with open(save_path, "xb") as f:
+                    f.write(body)
+            except FileExistsError:
+                pass
+            self._saved.add(filename)
+            LOG.info(
+                "XHR download captured during download action",
+                filename=filename,
+                size=len(body),
+            )
+        except Exception:
+            LOG.warning("Failed to capture XHR download response", exc_info=True)
+
+    def _on_new_page(self, page: Page) -> None:
+        if not self._active:
+            return
+        page.on("response", self._on_response)
+        self._extra_pages.append(page)
+
+    def enable(self) -> None:
+        if getattr(self._page.context, "_skyvern_cdp_download_active", False):
+            return
+        self._page.on("response", self._on_response)
+        self._page.context.on("page", self._on_new_page)
+        self._active = True
+
+    def disable(self) -> None:
+        if not self._active:
+            return
+        self._page.remove_listener("response", self._on_response)
+        self._page.context.remove_listener("page", self._on_new_page)
+        for page in self._extra_pages:
+            try:
+                page.remove_listener("response", self._on_response)
+            except Exception:
+                pass
+        self._extra_pages.clear()
+        self._active = False
+
+
 class ActionHandler:
     _handled_action_types: dict[
         ActionType,
@@ -391,7 +648,7 @@ class ActionHandler:
         cls._teardown_action_types[action_type] = handler
 
     @staticmethod
-    @traced()
+    @traced(name="skyvern.agent.action", role="wrapper")
     async def handle_action(
         scraped_page: ScrapedPage,
         task: Task,
@@ -399,19 +656,32 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
+        # task_id, step_id auto-attached by @traced from SkyvernContext
+        _action_span = otel_trace.get_current_span()
+        _action_span.set_attribute("action_type", str(action.action_type))
+        _action_span.set_attribute("step_order", step.order)
+        if getattr(action, "element_id", None):
+            _action_span.set_attribute("element_id", action.element_id)
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
         trigger_download_action = (
             isinstance(action, (SelectOptionAction, ClickAction, DownloadFileAction)) and action.download
         )
+        # triggers_download splits the bimodal distribution: non-download actions
+        # finish in ~1s while download actions can burn up to BROWSER_DOWNLOAD_MAX_WAIT_TIME
+        # (120s) polling for the file. Explains the 36s p95 on this wrapper.
+        _action_span.set_attribute("triggers_download", trigger_download_action)
+        _tracer = otel_trace.get_tracer("skyvern")
         if not trigger_download_action:
-            results = await ActionHandler._handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
+            with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+                apply_context_attrs(_hi_span)
+                results = await ActionHandler._handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
             return results
@@ -422,65 +692,195 @@ class ActionHandler:
                 run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
             )
         )
+        download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
+
+        def _capture_download_event(download: Download) -> None:
+            if not download_event.done():
+                download_event.set_result(download)
+
+        async def _list_observed_download_files() -> list[str]:
+            files = list_files_in_directory(download_dir)
+            if task.browser_session_id:
+                files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                )
+                files = files + files_in_browser_session
+            return files
+
         initial_page_count = 0
         page_url_before_download = page.url
         # get the initial page count
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
 
-        list_files_before = list_files_in_directory(download_dir)
-        if task.browser_session_id:
-            files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                organization_id=task.organization_id, browser_session_id=task.browser_session_id
-            )
-            list_files_before = list_files_before + files_in_browser_session
+        list_files_before = await _list_observed_download_files()
         LOG.info(
             "Number of files in download directory before action",
             num_downloaded_files_before=len(list_files_before),
             download_dir=download_dir,
         )
 
+        xhr_capture = ScopedXhrDownloadCapture(page, download_dir)
         download_triggered = False
+        page.on("download", _capture_download_event)
         try:
-            results = await ActionHandler._handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
+            xhr_capture.enable()
+            with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
+                apply_context_attrs(_hi_span)
+                results = await ActionHandler._handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
             if not results:
                 return results
-            try:
-                LOG.info(
-                    "Checking if there is any new files after click",
-                    download_dir=download_dir,
-                )
-                async with asyncio.timeout(task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME):
-                    while True:
-                        list_files_after = list_files_in_directory(download_dir)
-                        if task.browser_session_id:
-                            files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                                organization_id=task.organization_id, browser_session_id=task.browser_session_id
-                            )
-                            list_files_after = list_files_after + files_in_browser_session
+            _download_timeout = task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME
+            _download_event_grace_seconds = min(DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, _download_timeout)
+            with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
+                apply_context_attrs(_dl_wait_span)
+                _dl_wait_span.set_attribute("timeout_seconds", _download_timeout)
+                _dl_wait_span.set_attribute("download_event_grace_seconds", _download_event_grace_seconds)
+                no_signal_grace_seconds = min(_download_timeout, BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME)
+                _dl_wait_span.set_attribute("no_signal_grace_seconds", no_signal_grace_seconds)
+                _poll_iterations = 0
+                captured_download: Download | None = None
+                download_event_captured = False
+                download_event_captured_at: float | None = None
+                download_event_fallback_attempted = False
+                download_event_fallback_used = False
+                download_event_fallback_failed = False
+                download_signal_observed = False
+                download_signal_source: str | None = None
+                download_signal_elapsed_seconds: float | None = None
+                download_signal_poll_iterations: int | None = None
+                download_wait_started_at = time.monotonic()
 
-                        if len(list_files_after) > len(list_files_before):
-                            LOG.info(
-                                "Found new files in download directory after action",
-                                num_downloaded_files_after=len(list_files_after),
-                                download_dir=download_dir,
-                                workflow_run_id=task.workflow_run_id,
-                            )
-                            download_triggered = True
-                            break
-                        await asyncio.sleep(1)
+                def _record_download_signal(source: str) -> None:
+                    nonlocal download_signal_observed
+                    nonlocal download_signal_source
+                    nonlocal download_signal_elapsed_seconds
+                    nonlocal download_signal_poll_iterations
 
-            except asyncio.TimeoutError:
-                LOG.warning(
-                    "No file to download after action",
-                    workflow_run_id=task.workflow_run_id,
-                )
+                    if download_signal_elapsed_seconds is not None:
+                        return
+                    download_signal_observed = True
+                    download_signal_source = source
+                    download_signal_elapsed_seconds = time.monotonic() - download_wait_started_at
+                    download_signal_poll_iterations = _poll_iterations
+
+                try:
+                    LOG.info(
+                        "Checking if there is any new files after click",
+                        download_dir=download_dir,
+                    )
+                    async with asyncio.timeout(_download_timeout):
+                        while True:
+                            _poll_iterations += 1
+                            if download_event.done() and captured_download is None:
+                                captured_download = download_event.result()
+                                download_event_captured = True
+                                download_event_captured_at = time.monotonic()
+                                _record_download_signal("browser_download_event")
+                                LOG.info(
+                                    "Captured download event; waiting for active run directory file",
+                                    download_dir=download_dir,
+                                    workflow_run_id=task.workflow_run_id,
+                                    download_signal_elapsed_seconds=download_signal_elapsed_seconds,
+                                    download_signal_poll_iterations=download_signal_poll_iterations,
+                                )
+
+                            list_files_after = await _list_observed_download_files()
+
+                            if len(list_files_after) > len(list_files_before):
+                                _record_download_signal("download_file_detected")
+                                LOG.info(
+                                    "Found new files in download directory after action",
+                                    num_downloaded_files_after=len(list_files_after),
+                                    download_dir=download_dir,
+                                    workflow_run_id=task.workflow_run_id,
+                                    download_signal_elapsed_seconds=download_signal_elapsed_seconds,
+                                    download_signal_poll_iterations=download_signal_poll_iterations,
+                                )
+                                download_triggered = True
+                                break
+
+                            if (
+                                captured_download is not None
+                                and download_event_captured_at is not None
+                                and not download_event_fallback_attempted
+                                and time.monotonic() - download_event_captured_at >= _download_event_grace_seconds
+                            ):
+                                download_event_fallback_attempted = True
+                                download_target = _download_target_path(
+                                    download_dir, captured_download.suggested_filename
+                                )
+                                try:
+                                    await captured_download.save_as(download_target)
+                                    if download_target.exists() and download_target.stat().st_size == 0:
+                                        download_target.unlink(missing_ok=True)
+                                        LOG.warning(
+                                            "Captured download event fallback produced an empty file; marking download triggered without artifact",
+                                            download_dir=download_dir,
+                                            download_target=str(download_target),
+                                            workflow_run_id=task.workflow_run_id,
+                                        )
+                                        list_files_after = await _list_observed_download_files()
+                                        download_triggered = True
+                                        break
+
+                                    list_files_after = await _list_observed_download_files()
+                                    LOG.info(
+                                        "Copied captured download event to active run directory",
+                                        download_dir=download_dir,
+                                        download_target=str(download_target),
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                    download_triggered = True
+                                    download_event_fallback_used = True
+                                    break
+                                except Exception:
+                                    LOG.warning(
+                                        "Failed to copy captured download event to active run directory",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                        exc_info=True,
+                                    )
+                                    download_event_fallback_failed = True
+                                    break
+                            elapsed_since_action = time.monotonic() - download_wait_started_at
+                            if not download_signal_observed and elapsed_since_action >= no_signal_grace_seconds:
+                                LOG.warning(
+                                    "No download signal observed after action",
+                                    workflow_run_id=task.workflow_run_id,
+                                    no_signal_grace_seconds=no_signal_grace_seconds,
+                                )
+                                break
+                            sleep_seconds: float = 1.0
+                            if not download_signal_observed:
+                                sleep_seconds = min(1, max(0.0, no_signal_grace_seconds - elapsed_since_action))
+                            await asyncio.sleep(sleep_seconds)
+
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "No file to download after action",
+                        workflow_run_id=task.workflow_run_id,
+                    )
+                finally:
+                    _dl_wait_span.set_attribute("download_signal_observed", download_signal_observed)
+                    if download_signal_source:
+                        _dl_wait_span.set_attribute("download_signal_source", download_signal_source)
+                    if download_signal_elapsed_seconds is not None:
+                        _dl_wait_span.set_attribute("download_signal_elapsed_seconds", download_signal_elapsed_seconds)
+                    if download_signal_poll_iterations is not None:
+                        _dl_wait_span.set_attribute("download_signal_poll_iterations", download_signal_poll_iterations)
+                    _dl_wait_span.set_attribute("download_triggered", download_triggered)
+                    _dl_wait_span.set_attribute("poll_iterations", _poll_iterations)
+                    _dl_wait_span.set_attribute("download_event_captured", download_event_captured)
+                    _dl_wait_span.set_attribute("download_event_fallback_attempted", download_event_fallback_attempted)
+                    _dl_wait_span.set_attribute("download_event_fallback_used", download_event_fallback_used)
+                    _dl_wait_span.set_attribute("download_event_fallback_failed", download_event_fallback_failed)
 
             if not download_triggered:
                 results[-1].download_triggered = False
@@ -496,9 +896,17 @@ class ActionHandler:
                 timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
             )
 
-            # Calculate newly downloaded file names
+            # Re-scan after waiting for .crdownload files to settle. The first
+            # snapshot stops at the earliest download signal, while late browser
+            # artifacts can still appear before task cleanup persists files.
+            list_files_after = await _list_observed_download_files()
             new_file_paths = set(list_files_after) - set(list_files_before)
-            downloaded_file_names = [os.path.basename(fp) for fp in new_file_paths]
+            deduplicated_paths = _deduplicate_new_downloaded_file_paths(
+                new_file_paths,
+                workflow_run_id=task.workflow_run_id,
+                observed_file_paths=set(list_files_after),
+            )
+            downloaded_file_names = [os.path.basename(fp) for fp in deduplicated_paths]
             if downloaded_file_names:
                 results[-1].downloaded_files = downloaded_file_names
                 action.downloaded_files = downloaded_file_names
@@ -510,6 +918,7 @@ class ActionHandler:
 
             return results
         finally:
+            xhr_capture.disable()
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()
@@ -548,6 +957,11 @@ class ActionHandler:
                             exc_info=True,
                         )
 
+            try:
+                _remove_download_listener(page, _capture_download_event)
+            except Exception:
+                LOG.warning("Failed to remove one-shot download event listener", exc_info=True)
+
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
 
@@ -559,35 +973,16 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
+        await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
         LOG.info(
             "Handling action",
             action_type=action.action_type,
             action_id=action.action_id,
             status=action.status,
-            source_action_id=action.source_action_id,
             step_order=action.step_order,
             action_order=action.action_order,
-            confidence_float=action.confidence_float,
-            description=action.description,
-            reasoning=action.reasoning,
-            intention=action.intention,
-            response=action.response,
             element_id=action.element_id,
             errors=action.errors,
-            file_name=action.file_name,
-            file_url=action.file_url,
-            download=action.download,
-            download_triggered=action.download_triggered,
-            is_upload_file_tag=action.is_upload_file_tag,
-            text=action.text,
-            input_or_select_context=action.input_or_select_context,
-            option=action.option,
-            is_checked=action.is_checked,
-            verified=action.verified,
-            click_context=action.click_context,
-            totp_timing_info=action.totp_timing_info,
-            has_mini_agent=action.has_mini_agent,
-            skip_auto_complete_tab=action.skip_auto_complete_tab,
         )
         actions_result: list[ActionResult] = []
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
@@ -609,6 +1004,7 @@ class ActionHandler:
                 handler = ActionHandler._handled_action_types[action.action_type]
                 results = await handler(action, page, scraped_page, task, step)
                 actions_result.extend(results)
+                await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
                 # do the teardown
                 teardown = ActionHandler._teardown_action_types.get(action.action_type)
                 if teardown:
@@ -694,7 +1090,7 @@ def check_for_invalid_web_action(
     return []
 
 
-@traced()
+@traced(name="skyvern.agent.action.solve_captcha")
 async def handle_solve_captcha_action(
     action: actions.SolveCaptchaAction,
     page: Page,
@@ -710,7 +1106,7 @@ async def handle_solve_captcha_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.click")
 async def handle_click_action(
     action: actions.ClickAction,
     page: Page,
@@ -829,6 +1225,8 @@ async def handle_click_action(
                 action,
                 skyvern_element,
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                incremental_scraped=incremental_scraped,
+                skyvern_frame=skyvern_frame,
             )
             if page.url != original_url:
                 return results
@@ -873,7 +1271,7 @@ async def handle_click_action(
     return results
 
 
-@traced()
+@traced(name="skyvern.agent.action.click_dropdown_sequential")
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
     action_history: list[ActionResult],
@@ -928,6 +1326,12 @@ async def handle_sequential_click_for_dropdown(
         }
         action_history_str = json.dumps(action_result)
 
+    # SKY-9718 Layer 1: sequential-click after-dropdown verifier path. Keep
+    # Skyvern IDs (default html_need_skyvern_attrs=True) because
+    # `new_elements_ids` is threaded and the LLM compares those IDs to what's
+    # rendered. Gate lean on the PostHog flag.
+    _ctx = skyvern_context.current()
+    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     prompt = load_prompt_with_elements(
         element_tree_builder=scraped_page_after_open,
         prompt_engine=prompt_engine,
@@ -938,6 +1342,9 @@ async def handle_sequential_click_for_dropdown(
         without_screenshots=True,
         action_history=action_history_str,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        lean_compress_long_href=lean_enabled,
+        lean_compress_image_src=lean_enabled,
+        lean_strip_url_query_strings=lean_enabled,
     )
     response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
         prompt=prompt,
@@ -999,7 +1406,7 @@ async def handle_sequential_click_for_dropdown(
     )
 
 
-@traced()
+@traced(name="skyvern.agent.action.click_to_download")
 async def handle_click_to_download_file_action(
     action: actions.ClickAction,
     page: Page,
@@ -1138,7 +1545,7 @@ async def _handle_multi_field_totp_sequence(
     return None  # Success
 
 
-@traced()
+@traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
     page: Page,
@@ -1194,6 +1601,7 @@ async def handle_input_text_action(
         element_id=skyvern_element.get_id(),
         option=SelectOption(label=text),
         intention=action.intention,
+        input_or_select_context=action.input_or_select_context,
     )
     if await skyvern_element.get_selectable():
         LOG.info(
@@ -1589,7 +1997,47 @@ async def handle_input_text_action(
             await skyvern_element.press_key("Tab")
 
 
-@traced()
+_URL_RECOVERY_EDIT_DISTANCE_FRACTION = 0.1
+_URL_RECOVERY_MAX_EDIT_DISTANCE = 10
+
+
+def _origin_key(parsed: urllib.parse.ParseResult) -> tuple[str, str | None, int | None, str]:
+    return (parsed.scheme.lower(), parsed.hostname, parsed.port, parsed.path)
+
+
+def _find_similar_url_in_text(candidate_url: str, text: str) -> str | None:
+    # Bounded-edit-distance substring search via fuzzysearch (Bitap /
+    # Levenshtein-automaton kernel). Recovers a verbatim user-supplied URL when
+    # the LLM flips a few characters inside a long pre-signed token. The
+    # origin-key gate prevents any cross-origin swap.
+    if not candidate_url or not text:
+        return None
+    normalized = candidate_url.strip()
+    try:
+        candidate = urllib.parse.urlparse(normalized)
+    except ValueError:
+        return None
+    if not candidate.scheme or not candidate.hostname:
+        return None
+
+    max_dist = min(max(1, int(len(normalized) * _URL_RECOVERY_EDIT_DISTANCE_FRACTION)), _URL_RECOVERY_MAX_EDIT_DISTANCE)
+    # Case-insensitive match so scheme/hostname casing doesn't consume the edit-distance budget.
+    matches = find_near_matches(normalized.lower(), text.lower(), max_l_dist=max_dist)
+    if not matches:
+        return None
+
+    best = min(matches, key=lambda m: m.dist)
+    matched = text[best.start : best.end]
+    try:
+        parsed = urllib.parse.urlparse(matched)
+    except ValueError:
+        return None
+    if _origin_key(parsed) != _origin_key(candidate):
+        return None
+    return matched
+
+
+@traced(name="skyvern.agent.action.upload_file")
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
     page: Page,
@@ -1612,12 +2060,24 @@ async def handle_upload_file_action(
         and decoded_url not in str(task.navigation_payload)
         and decoded_url not in str(task.navigation_goal)
     ):
-        LOG.warning(
-            "LLM might be imagining the file url, which is not in navigation payload",
-            action=action,
-            file_url=action.file_url,
+        user_sources = f"{task.navigation_goal or ''}\n{task.navigation_payload or ''}"
+        recovered_url = _find_similar_url_in_text(file_url, user_sources) or _find_similar_url_in_text(
+            decoded_url, user_sources
         )
-        return [ActionFailure(ImaginaryFileUrl(action.file_url))]
+        if recovered_url:
+            LOG.warning(
+                "LLM-returned file_url appears to be a corrupted copy of a user-provided URL; using the verbatim URL",
+                action=action,
+            )
+            file_url = recovered_url
+            decoded_url = urllib.parse.unquote(file_url)
+        else:
+            LOG.warning(
+                "LLM might be imagining the file url, which is not in navigation payload",
+                action=action,
+                file_url=action.file_url,
+            )
+            return [ActionFailure(ImaginaryFileUrl(action.file_url))]
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
@@ -1675,7 +2135,7 @@ async def handle_upload_file_action(
 
 # This function is deprecated in 'extract-actions' prompt. Downloads are handled by the click action handler now.
 # Currently, it's only used for the download action triggered by the code.
-@traced()
+@traced(name="skyvern.agent.action.download_file")
 async def handle_download_file_action(
     action: actions.DownloadFileAction,
     page: Page,
@@ -1735,7 +2195,7 @@ async def handle_download_file_action(
         return [ActionFailure(e)]
 
 
-@traced()
+@traced(name="skyvern.agent.action.null")
 async def handle_null_action(
     action: actions.NullAction,
     page: Page,
@@ -1746,7 +2206,7 @@ async def handle_null_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.select_option")
 async def handle_select_option_action(
     action: actions.SelectOptionAction,
     page: Page,
@@ -1806,6 +2266,7 @@ async def handle_select_option_action(
                 element_id=selectable_child.get_id(),
                 option=action.option,
                 intention=action.intention,
+                input_or_select_context=action.input_or_select_context,
             )
             action = select_action
             skyvern_element = selectable_child
@@ -1870,6 +2331,7 @@ async def handle_select_option_action(
             element_id=blocking_element.get_id(),
             option=action.option,
             intention=action.intention,
+            input_or_select_context=action.input_or_select_context,
         )
         action = select_action
         skyvern_element = blocking_element
@@ -2067,7 +2529,7 @@ async def handle_select_option_action(
         await incremental_scraped.stop_listen_dom_increment()
 
 
-@traced()
+@traced(name="skyvern.agent.action.checkbox")
 async def handle_checkbox_action(
     action: actions.CheckboxAction,
     page: Page,
@@ -2096,7 +2558,7 @@ async def handle_checkbox_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.wait")
 async def handle_wait_action(
     action: actions.WaitAction,
     page: Page,
@@ -2108,7 +2570,7 @@ async def handle_wait_action(
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
-@traced()
+@traced(name="skyvern.agent.action.hover")
 async def handle_hover_action(
     action: actions.HoverAction,
     page: Page,
@@ -2147,7 +2609,7 @@ async def handle_hover_action(
         return [ActionFailure(FailToHover(skyvern_element.get_id(), msg=str(exc)))]
 
 
-@traced()
+@traced(name="skyvern.agent.action.terminate")
 async def handle_terminate_action(
     action: actions.TerminateAction,
     page: Page,
@@ -2171,7 +2633,7 @@ async def handle_terminate_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.complete_verification")
 async def handle_complete_action(
     action: actions.CompleteAction,
     page: Page,
@@ -2179,58 +2641,68 @@ async def handle_complete_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    if not action.verified and task.navigation_goal:
-        LOG.info(
-            "CompleteAction hasn't been verified, going to verify the user goal",
+    # verification_path separates the three distinct runtime paths that
+    # roll up to this span — explains the 175x p95/p50 ratio.
+    _span = otel_trace.get_current_span()
+    if action.verified or not task.navigation_goal:
+        _span.set_attribute("verification_path", "already_verified")
+        return [ActionSuccess()]
+
+    LOG.info(
+        "CompleteAction hasn't been verified, going to verify the user goal",
+        workflow_run_id=task.workflow_run_id,
+    )
+    try:
+        verification_result = await app.agent.complete_verify(page, scraped_page, task, step)
+    except Exception as e:
+        _span.set_attribute("verification_path", "needs_llm_error")
+        LOG.exception(
+            "Failed to verify the complete action",
             workflow_run_id=task.workflow_run_id,
         )
-        try:
-            verification_result = await app.agent.complete_verify(page, scraped_page, task, step)
-        except Exception as e:
-            LOG.exception(
-                "Failed to verify the complete action",
-                workflow_run_id=task.workflow_run_id,
-            )
-            return [ActionFailure(exception=e)]
+        return [ActionFailure(exception=e)]
 
-        # Check if we should terminate instead of complete
-        # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
-        if verification_result.is_terminate:
-            LOG.warning(
-                "CompleteAction verification determined task should terminate instead (termination-aware experiment)",
-                workflow_run_id=task.workflow_run_id,
-                thoughts=verification_result.thoughts,
-                status=verification_result.status if verification_result.status else "legacy",
-            )
-            # Create a TerminateAction and execute it
-            terminate_action = actions.TerminateAction(
-                reasoning=verification_result.thoughts,
-                organization_id=action.organization_id,
-                workflow_run_id=action.workflow_run_id,
-                task_id=action.task_id,
-                step_id=action.step_id,
-                step_order=action.step_order,
-                action_order=action.action_order,
-            )
-            results = await handle_terminate_action(terminate_action, page, scraped_page, task, step)
-            action.action_type = ActionType.TERMINATE
-            action.reasoning = terminate_action.reasoning
-            action.errors = terminate_action.errors
-            return results
-
-        if not verification_result.is_complete:
-            return [ActionFailure(exception=IllegitComplete(data={"error": verification_result.thoughts}))]
-
-        LOG.info(
-            "CompleteAction has been verified successfully",
+    # Check if we should terminate instead of complete
+    # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
+    if verification_result.is_terminate:
+        _span.set_attribute("verification_path", "terminate_requested")
+        LOG.warning(
+            "CompleteAction verification determined task should terminate instead (termination-aware experiment)",
             workflow_run_id=task.workflow_run_id,
+            thoughts=verification_result.thoughts,
+            status=verification_result.status if verification_result.status else "legacy",
         )
-        action.verified = True
+        # Create a TerminateAction and execute it
+        terminate_action = actions.TerminateAction(
+            reasoning=verification_result.thoughts,
+            organization_id=action.organization_id,
+            workflow_run_id=action.workflow_run_id,
+            task_id=action.task_id,
+            step_id=action.step_id,
+            step_order=action.step_order,
+            action_order=action.action_order,
+        )
+        results = await handle_terminate_action(terminate_action, page, scraped_page, task, step)
+        action.action_type = ActionType.TERMINATE
+        action.reasoning = terminate_action.reasoning
+        action.errors = terminate_action.errors
+        return results
+
+    if not verification_result.is_complete:
+        _span.set_attribute("verification_path", "needs_llm_rejected")
+        return [ActionFailure(exception=IllegitComplete(data={"error": verification_result.thoughts}))]
+
+    _span.set_attribute("verification_path", "needs_llm_verified")
+    LOG.info(
+        "CompleteAction has been verified successfully",
+        workflow_run_id=task.workflow_run_id,
+    )
+    action.verified = True
 
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.extract")
 async def handle_extract_action(
     action: actions.ExtractAction,
     page: Page,
@@ -2252,7 +2724,7 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
-@traced()
+@traced(name="skyvern.agent.action.scroll")
 async def handle_scroll_action(
     action: actions.ScrollAction,
     page: Page,
@@ -2260,6 +2732,8 @@ async def handle_scroll_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if action.scroll_x is None or action.scroll_y is None:
+        return [ActionFailure(Exception("ScrollAction is missing scroll_x/scroll_y coordinates"))]
     if action.element_id:
         # Element-based scrolling from extract-action prompt. Uses
         # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
@@ -2366,7 +2840,7 @@ async def handle_scroll_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.keypress")
 async def handle_keypress_action(
     action: actions.KeypressAction,
     page: Page,
@@ -2378,7 +2852,7 @@ async def handle_keypress_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.move")
 async def handle_move_action(
     action: actions.MoveAction,
     page: Page,
@@ -2386,11 +2860,13 @@ async def handle_move_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if action.x is None or action.y is None:
+        return [ActionFailure(Exception("MoveAction is missing x/y coordinates"))]
     await EventStrategyFactory.move_cursor(page, action.x, action.y)
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.drag")
 async def handle_drag_action(
     action: actions.DragAction,
     page: Page,
@@ -2402,7 +2878,7 @@ async def handle_drag_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.verification_code")
 async def handle_verification_code_action(
     action: actions.VerificationCodeAction,
     page: Page,
@@ -2419,7 +2895,7 @@ async def handle_verification_code_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.left_mouse")
 async def handle_left_mouse_action(
     action: actions.LeftMouseAction,
     page: Page,
@@ -2431,7 +2907,7 @@ async def handle_left_mouse_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.goto_url")
 async def handle_goto_url_action(
     action: actions.GotoUrlAction,
     page: Page,
@@ -2443,7 +2919,7 @@ async def handle_goto_url_action(
     return [ActionSuccess()]
 
 
-@traced()
+@traced(name="skyvern.agent.action.close_page")
 async def handle_close_page_action(
     action: actions.ClosePageAction,
     page: Page,
@@ -2480,6 +2956,12 @@ ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_acti
 def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+    if secret_value is not None:
+        credential_parameter_key = workflow_run_context.find_credential_parameter_key_for_secret(parameter)
+        if credential_parameter_key is not None:
+            current_context = skyvern_context.current()
+            if current_context is not None:
+                current_context.active_credential_parameter_key = credential_parameter_key
     return secret_value if secret_value is not None else parameter
 
 
@@ -2513,6 +2995,19 @@ def generate_totp_value_with_task(task: Task, parameter: str) -> str:
     return generate_totp_value(task.workflow_run_id, parameter)
 
 
+async def _did_page_respond(
+    incremental_scraped: IncrementalScrapePage,
+    skyvern_frame: SkyvernFrame | None = None,
+) -> bool:
+    try:
+        if skyvern_frame:
+            await skyvern_frame.safe_wait_for_animation_end()
+        return (await incremental_scraped.get_incremental_elements_num()) > 0
+    except Exception:
+        LOG.debug("Failed to check incremental elements after click", exc_info=True)
+        return True
+
+
 async def chain_click(
     task: Task,
     scraped_page: ScrapedPage,
@@ -2521,6 +3016,8 @@ async def chain_click(
     skyvern_element: SkyvernElement,
     pending_upload_files: list[str] | str | None = None,
     timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
+    incremental_scraped: IncrementalScrapePage | None = None,
+    skyvern_frame: SkyvernFrame | None = None,
 ) -> List[ActionResult]:
     # Add a defensive page handler here in case a click action opens a file chooser.
     # This automatically dismisses the dialog
@@ -2536,28 +3033,47 @@ async def chain_click(
         file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
 
     is_filechooser_trigger = False
+    is_upload_action = bool(action.file_url)
+    context = skyvern_context.current()
+    has_pending = (
+        context is not None and context.pending_file_chooser is not None and context.pending_file_chooser.page is page
+    )
+
+    if is_upload_action and has_pending and context is not None:
+        LOG.info("New UPLOAD_FILE action arrived, cleaning up stale pending file chooser listener")
+        context.cleanup_pending_file_chooser()
+        has_pending = False
 
     async def fc_func(fc: FileChooser) -> None:
         nonlocal is_filechooser_trigger
         is_filechooser_trigger = True
         await fc.set_files(files=file)
 
-    page.on("filechooser", fc_func)
-    LOG.info("Registered file chooser listener", action=action, path=file)
+    if not has_pending:
+        page.on("filechooser", fc_func)
+        LOG.info("Registered file chooser listener", action=action, path=file)
+    else:
+        LOG.info(
+            "Skipping defensive file chooser listener — pending deferred listener exists",
+            action=action,
+        )
 
     """
     Clicks on an element identified by the css and its parent if failed.
     :param css: css of the element to click
     """
+    # Tracks the return value so the finally block can inspect click success.
+    action_results: list[ActionResult] = []
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
-        return [ActionSuccess()]
+        action_results = [ActionSuccess()]
+        return action_results
 
     except Exception as e:
-        action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
+        action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
 
         if skyvern_element.get_tag_name() == "label":
             try:
@@ -2706,26 +3222,96 @@ async def chain_click(
         except Exception as e:
             action_results.append(ActionFailure(FailToClick(action.element_id, anchor="blocking_element", msg=str(e))))
 
-        return action_results
+        # Only attempt JS click when the caller provided an observer to verify
+        # the result.  Without one we can't distinguish success from a no-op,
+        # so preserve the old behavior (return accumulated failures).
+        if incremental_scraped is None:
+            return action_results
+
+        # JS click dispatches directly on the DOM node, bypassing hit-testing.
+        LOG.info(
+            "Chain click: blocker is not parent/sibling, trying JS click on original element",
+            action=action,
+            element=str(skyvern_element),
+            locator=locator,
+        )
+        try:
+            await skyvern_element.click_in_javascript()
+            if await _did_page_respond(incremental_scraped, skyvern_frame):
+                action_results.append(ActionSuccess())
+                return action_results
+            LOG.info(
+                "Chain click: JS click did not trigger a page response",
+                action=action,
+                element=str(skyvern_element),
+            )
+            action_results.append(
+                ActionFailure(FailToClick(action.element_id, anchor="self_js", msg="no page response after click"))
+            )
+            return action_results
+        except Exception as e:
+            action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
+            return action_results
+
     finally:
-        LOG.info("Remove file chooser listener", action=action)
-
         # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
-        # Sleep for 15 seconds after uploading a file to let the page process it
-        # Removing this breaks file uploads using the filechooser
-        if file:
-            await asyncio.sleep(15)
-        page.remove_listener("filechooser", fc_func)
+        click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
 
-        if action.file_url and not is_filechooser_trigger:
+        if is_filechooser_trigger:
+            # File chooser opened during this click — upload completed normally
+            LOG.info("File chooser triggered during this click", action=action)
+            if file:
+                await asyncio.sleep(15)
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
+            if context is not None and context.pending_file_chooser is not None:
+                context.cleanup_pending_file_chooser()
+
+        elif is_upload_action and file and click_succeeded and context is not None:
+            # UPLOAD_FILE click succeeded but file chooser didn't open (e.g. popup intercepted).
+            # Defer the listener so a subsequent click can trigger it.
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
             LOG.warning(
-                "Action has file_url, but filechoose even hasn't been triggered. Upload file attempt seems to fail",
+                "UPLOAD_FILE click succeeded but file chooser was not triggered — deferring listener",
                 action=action,
             )
-            return [ActionFailure(WrongElementToUploadFile(action.element_id))]
+            # Clean up any existing pending listener (may be on a different page)
+            if context.pending_file_chooser is not None:
+                context.cleanup_pending_file_chooser()
+
+            pending = PendingFileChooserListener(page=page, file_paths=file)
+
+            async def deferred_fc_handler(fc: FileChooser) -> None:
+                pending.triggered = True
+                await fc.set_files(files=pending.file_paths)
+                # Auto-remove after firing to prevent double-consumption
+                pending.cleanup()
+
+            pending.handler = deferred_fc_handler
+            page.on("filechooser", deferred_fc_handler)
+            context.pending_file_chooser = pending
+
+        elif (
+            context is not None and context.pending_file_chooser is not None and context.pending_file_chooser.triggered
+        ):
+            # A previous UPLOAD_FILE's deferred listener was consumed by this click
+            LOG.info("Pending file chooser from previous UPLOAD_FILE was consumed by this click", action=action)
+            await asyncio.sleep(15)
+            context.cleanup_pending_file_chooser()
+
+        else:
+            # No file chooser involved — just clean up the defensive listener
+            if not has_pending:
+                page.remove_listener("filechooser", fc_func)
+
+        if is_upload_action:
+            for r in action_results:
+                if isinstance(r, ActionSuccess):
+                    r.upload_file_triggered = is_filechooser_trigger
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.auto_completion")
 async def choose_auto_completion_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -3115,7 +3701,7 @@ async def input_or_auto_complete_input(
         return None
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.discover_and_select")
 async def discover_and_select_from_full_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -3300,7 +3886,7 @@ async def discover_and_select_from_full_dropdown(
         await incremental_scraped.stop_listen_dom_increment()
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.select_sequential")
 async def sequentially_select_from_dropdown(
     action: SelectOptionAction,
     input_or_select_context: InputOrSelectContext,
@@ -3407,7 +3993,7 @@ async def sequentially_select_from_dropdown(
             )
             continue
 
-        screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+        screenshot = await _screenshot_without_cursor(page, timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
         mini_goal = (
             input_or_select_context.field
             if not input_or_select_context.intention
@@ -3480,7 +4066,32 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
-@traced()
+def _extract_new_subtrees(elements: list[dict], new_ids: set[str]) -> list[dict]:
+    """Walk *elements* and return the minimal set of subtrees rooted at new IDs.
+
+    A "new root" is a node whose ``id`` is in *new_ids* but whose parent is
+    not.  This avoids including the entire page tree when a new dropdown is
+    injected inside an existing container — only the dropdown subtree (and its
+    children, which may also be new) is returned.
+
+    For portal-style dropdowns (appended as a direct ``<body>`` child), this
+    behaves identically to a top-level filter.
+    """
+    result: list[dict] = []
+    for element in elements:
+        _collect_new_roots(element, new_ids, result)
+    return result
+
+
+def _collect_new_roots(element: dict, new_ids: set[str], out: list[dict]) -> None:
+    if element.get("id") in new_ids:
+        out.append(element)
+        return
+    for child in element.get("children", []):
+        _collect_new_roots(child, new_ids, out)
+
+
+@traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
     options: CustomSelectPromptOptions,
@@ -3510,10 +4121,35 @@ async def select_from_emerging_elements(
     if len(new_interactable_element_ids) == 0:
         raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
 
-    prompt = load_prompt_with_elements(
-        element_tree_builder=scraped_page_after_open,
-        prompt_engine=prompt_engine,
-        template_name="custom-select",
+    # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
+    # which gets truncated on large pages, losing portal-rendered dropdown items.
+    new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    if new_element_subtrees:
+        _ctx = skyvern_context.current()
+        if _ctx and _ctx.enable_lean_element_tree:
+            new_element_subtrees = apply_lean_to_tree(
+                new_element_subtrees,
+                compress_image_src=True,
+                strip_url_query_strings=True,
+            )
+        incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in new_element_subtrees)
+    else:
+        LOG.warning(
+            "No subtrees matched new element IDs; falling back to full element tree",
+            current_element_id=current_element_id,
+            new_element_id_count=len(new_element_ids),
+        )
+        incremental_html = scraped_page_after_open.build_element_tree(html_need_skyvern_attrs=True)
+    LOG.debug(
+        "Built HTML for emerging-element custom-select",
+        current_element_id=current_element_id,
+        new_interactable_count=len(new_interactable_element_ids),
+        subtree_count=len(new_element_subtrees),
+        html_length=len(incremental_html),
+    )
+
+    prompt = prompt_engine.load_prompt(
+        "custom-select",
         is_date_related=options.is_date_related,
         field_information=options.field_information,
         required_field=options.required_field,
@@ -3521,6 +4157,7 @@ async def select_from_emerging_elements(
         navigation_goal=task.navigation_goal,
         new_elements_ids=new_interactable_element_ids,
         navigation_payload_str=json.dumps(task.navigation_payload),
+        elements=incremental_html,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
     LOG.info("Calling LLM to find the match element")
@@ -3539,6 +4176,14 @@ async def select_from_emerging_elements(
     element_id: str | None = json_response.get("id", None)
     if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+
+    new_ids_set = set(new_interactable_element_ids)
+    if element_id not in new_ids_set:
+        LOG.warning(
+            "custom-select returned element outside new_interactable_element_ids",
+            selected_element_id=element_id,
+            new_interactable_count=len(new_ids_set),
+        )
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
@@ -3573,7 +4218,7 @@ async def select_from_emerging_elements(
     return ActionSuccess()
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.select")
 async def select_from_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -3768,7 +4413,7 @@ async def select_from_dropdown(
         return single_select_result
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.select_by_value")
 async def select_from_dropdown_by_value(
     value: str,
     page: Page,
@@ -3995,7 +4640,7 @@ async def try_to_find_potential_scrollable_element(
     return skyvern_element
 
 
-@traced()
+@traced(name="skyvern.agent.dropdown.scroll_load_options")
 async def scroll_down_to_load_all_options(
     scrollable_element: SkyvernElement,
     page: Page,
@@ -4089,7 +4734,7 @@ async def normal_select(
         step=step,
         skyvern_element=skyvern_element,
     )
-    LOG.info(
+    LOG.debug(
         "Parsed input/select context",
         context=input_or_select_context,
     )
@@ -4240,6 +4885,76 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
     return None
 
 
+def _schedule_extraction_shadow_check_for_hit(
+    *,
+    task: Task,
+    workflow_run_id: str,
+    cache_key: str,
+    cached_value: Any,
+    cached_age_seconds: float,
+    scraped_page: ScrapedPage,
+    llm_key_override: str | None,
+    extract_information_prompt: str,
+) -> None:
+    shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+    )
+    shadow_schema = task.extracted_information_schema
+    # Snapshot screenshots at schedule time — scraped_page is mutable
+    # and may be refreshed before the background task runs.
+    shadow_screenshots = list(scraped_page.screenshots)
+
+    async def _shadow_gate() -> bool:
+        # Captures `task` by reference — safe because the cloud override
+        # only reads immutable identifiers (workflow_run_id, organization_id,
+        # workflow_permanent_id, task_id) set at construction.
+        return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
+
+    async def _shadow_llm_call() -> Any:
+        fresh = await shadow_llm_api_handler(
+            prompt=extract_information_prompt,
+            # step=None suppresses both update_step (token/cost accounting)
+            # and artifact persistence in LLMAPIHandlerFactory. Shadow calls
+            # are an observability side-channel — the user-visible request
+            # was served from cache, so they must not inflate step usage,
+            # billing, or artifact counts.
+            step=None,
+            screenshots=shadow_screenshots,
+            # Use the same prompt_name as the miss path so prompt-level
+            # LLM tuning (e.g. thinking-budget overrides) matches — otherwise
+            # cached (tuned) vs fresh (untuned) would diverge for config
+            # reasons unrelated to cache correctness.
+            prompt_name="extract-information",
+            force_dict=False,
+            system_prompt=task.workflow_system_prompt,
+        )
+        # Apply the same post-processing the miss path applies so the
+        # comparison is apples-to-apples against the cached value.
+        if shadow_schema:
+            fresh = validate_and_fill_extraction_result(
+                extraction_result=fresh,
+                schema=shadow_schema,
+            )
+        return fresh
+
+    # Bind prompt_name + cache_path so Datadog can split the shared
+    # extract_information.shadow_comparison stream by call site.
+    shadow_logger = structlog.get_logger().bind(
+        prompt_name="extract-information",
+        cache_path="handler",
+    )
+    extraction_shadow.schedule_shadow_check(
+        gate=_shadow_gate,
+        cache_key=cache_key,
+        workflow_run_id=workflow_run_id,
+        cached_value=cached_value,
+        cached_age_seconds=cached_age_seconds,
+        llm_call=_shadow_llm_call,
+        schema=shadow_schema,
+        logger=shadow_logger,
+    )
+
+
 async def extract_information_for_navigation_goal(
     task: Task,
     step: Step,
@@ -4261,14 +4976,19 @@ async def extract_information_for_navigation_goal(
     scraped_page_refreshed = await scraped_page.refresh()
     context = ensure_context()
 
+    # task.workflow_permanent_id is None on most fetch paths (tasks table has
+    # no such column); fall back to context. SKY-8992.
+    wpid_for_cache = task.workflow_permanent_id or context.workflow_permanent_id
+
     # Compute llm key up-front so the cache key includes it.
     llm_key_override = task.llm_key
     if await service_utils.is_cua_task(task=task):
         # CUA tasks should use the default data extraction llm key
         llm_key_override = None
 
-    # Compute local_datetime once so both the cache key and the prompt use the
-    # same value (avoids stale hits when date-relative extraction goals cross midnight).
+    # Rendered into the prompt as ``{{ local_datetime }}``. Intentionally not
+    # part of the cache key — content-hash alone defines cache identity, so
+    # two calls on byte-identical pages hit the cache regardless of wall clock.
     local_datetime_str = datetime.now(context.tz_info).isoformat()
 
     extracted_text_for_prompt = scraped_page_refreshed.extracted_text if task.include_extracted_text else None
@@ -4302,6 +5022,18 @@ async def extract_information_for_navigation_goal(
         local_datetime=local_datetime_str,
     )
 
+    # Self-heal guard: on the second retry onward (``retry_index > 1``) the
+    # previous attempts' cached result is suspect — the first retry already
+    # failed to complete, so continuing to hand the same cached value back
+    # is not going to recover. Bypass both cache tiers on retry #2+ and
+    # force a fresh LLM call; the dual-write after extraction overwrites
+    # both the in-run entry and the cross-run Redis entry.
+    # Retry #1 still uses the cache: transient failures (network blip,
+    # downstream flake) often recover without the extraction itself being
+    # the cause, and paying the LLM cost on every first retry would burn
+    # hit rate for no self-heal benefit.
+    is_retry_step = step.retry_index > 1
+
     # Best-effort cache lookup — any failure falls through to LLM. The `try`
     # is narrowed to just compute_cache_key + lookup so a downstream log
     # failure can't re-enter the except block and double-count the call as
@@ -4334,9 +5066,30 @@ async def extract_information_for_navigation_goal(
             error_code_mapping=error_code_mapping_str,
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
-            local_datetime=local_datetime_str,
+            workflow_system_prompt=task.workflow_system_prompt,
         )
-        lookup_result = extraction_cache.lookup(task.workflow_run_id, cache_key)
+        if is_retry_step:
+            # Proactively evict the in-run entry. The cross-run tier will be
+            # overwritten by the store() after the LLM call below.
+            evicted = extraction_cache.invalidate_key(task.workflow_run_id, cache_key)
+            LOG.info(
+                "extract_information cache bypassed on retry (self-heal)",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                step_id=step.step_id,
+                retry_index=step.retry_index,
+                cache_key=cache_key,
+                cache_hit=False,
+                # Covers both tiers — the in-run entry is evicted here and the
+                # cross-run entry will be overwritten by the store() below.
+                cache_scope=extraction_cache.SCOPE_RUN,
+                cache_age_seconds=None,
+                fallback_reason="retry_bypass",
+                in_run_entry_evicted=evicted,
+                cache_path="handler",
+            )
+        else:
+            lookup_result = extraction_cache.lookup(task.workflow_run_id, cache_key)
     except Exception:
         LOG.warning(
             "extract_information cache lookup failed; falling through to LLM",
@@ -4369,56 +5122,17 @@ async def extract_information_for_navigation_goal(
         # inside the background task so the cache-hit return is not blocked
         # by the flag provider (e.g. PostHog latency on the first hit per run).
         if cache_key is not None and task.workflow_run_id is not None:
-            shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
-            )
-            shadow_schema = task.extracted_information_schema
-            # Snapshot screenshots at schedule time — scraped_page is mutable
-            # and may be refreshed before the background task runs.
-            shadow_screenshots = list(scraped_page.screenshots)
-
-            async def _shadow_gate() -> bool:
-                # Captures `task` by reference — safe because the cloud override
-                # only reads immutable identifiers (workflow_run_id, organization_id,
-                # workflow_permanent_id, task_id) set at construction.
-                return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
-
-            async def _shadow_llm_call() -> Any:
-                fresh = await shadow_llm_api_handler(
-                    prompt=extract_information_prompt,
-                    # step=None suppresses both update_step (token/cost accounting)
-                    # and artifact persistence in LLMAPIHandlerFactory. Shadow calls
-                    # are an observability side-channel — the user-visible request
-                    # was served from cache, so they must not inflate step usage,
-                    # billing, or artifact counts.
-                    step=None,
-                    screenshots=shadow_screenshots,
-                    # Use the same prompt_name as the miss path so prompt-level
-                    # LLM tuning (e.g. thinking-budget overrides) matches — otherwise
-                    # cached (tuned) vs fresh (untuned) would diverge for config
-                    # reasons unrelated to cache correctness.
-                    prompt_name="extract-information",
-                    force_dict=False,
-                )
-                # Apply the same post-processing the miss path applies so the
-                # comparison is apples-to-apples against the cached value.
-                if shadow_schema:
-                    fresh = validate_and_fill_extraction_result(
-                        extraction_result=fresh,
-                        schema=shadow_schema,
-                    )
-                return fresh
-
-            extraction_shadow.schedule_shadow_check(
-                gate=_shadow_gate,
-                cache_key=cache_key,
+            _schedule_extraction_shadow_check_for_hit(
+                task=task,
                 workflow_run_id=task.workflow_run_id,
+                cache_key=cache_key,
                 cached_value=lookup_result.value,
-                # -1.0 sentinel marks "age unknown" so it's distinguishable in
-                # Datadog from "just-cached (0.0)".
-                cached_age_seconds=lookup_result.age_seconds if lookup_result.age_seconds is not None else -1.0,
-                llm_call=_shadow_llm_call,
-                schema=shadow_schema,
+                cached_age_seconds=lookup_result.age_seconds
+                if lookup_result.age_seconds is not None
+                else extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
+                scraped_page=scraped_page,
+                llm_key_override=llm_key_override,
+                extract_information_prompt=extract_information_prompt,
             )
         return ScrapeResult(scraped_data=lookup_result.value)
     if lookup_result is not None and lookup_result.hit:
@@ -4443,6 +5157,109 @@ async def extract_information_for_navigation_goal(
             cache_path="handler",
         )
 
+    # Cross-run (wpid-scoped) cache lookup (SKY-8873). Consulted after an
+    # in-run miss so the tight in-process dict stays the hot path. Returns
+    # None in OSS; the cloud override hits Redis and is gated behind the
+    # EXTRACT_INFORMATION_CACHE_REDIS PostHog flag. All errors are swallowed
+    # by the backend so a Redis hiccup just falls through to the LLM call.
+    # Skipped on retry — the subsequent dual-write overwrites any stale
+    # Redis entry for this key with the fresh LLM result.
+    cross_run_value: Any | None = None
+    if cache_key is not None and not is_retry_step:
+        try:
+            cross_run_value = await app.AGENT_FUNCTION.lookup_cross_run_extraction_cache(wpid_for_cache, cache_key)
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache lookup raised",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=task.workflow_permanent_id,
+                organization_id=task.organization_id,
+                cache_key=cache_key,
+                exc_info=True,
+            )
+            cross_run_value = None
+
+    # Cross-run hit with a non-cacheable value type (e.g. a Redis payload
+    # that decoded to a bool or number). Mirror the in-run warning so the
+    # cross-run tier has the same diagnostic surface during rollout —
+    # without it, a corrupt-but-decodable entry would silently fall
+    # through to the LLM with no trail for post-hoc investigation.
+    if cache_key is not None and cross_run_value is not None and not isinstance(cross_run_value, (dict, list, str)):
+        LOG.warning(
+            "extract_information cross-run cache hit returned non-cacheable value type; falling through to LLM",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            organization_id=task.organization_id,
+            cache_key=cache_key,
+            value_type=type(cross_run_value).__name__,
+            cache_path="handler",
+        )
+        cross_run_value = None
+
+    if cache_key is not None and cross_run_value is not None and isinstance(cross_run_value, (dict, list, str)):
+        LOG.info(
+            "extract_information cache hit — skipping LLM call (cross-run)",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            cache_key=cache_key,
+            cache_hit=True,
+            cache_scope=extraction_cache.SCOPE_WPID,
+            cache_age_seconds=None,
+            fallback_reason=None,
+            cache_path="handler",
+        )
+        # Backfill the in-run cache so subsequent identical lookups in this
+        # run short-circuit without crossing the Redis boundary.
+        try:
+            extraction_cache.store(task.workflow_run_id, cache_key, cross_run_value)
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache backfill to in-run failed",
+                exc_info=True,
+            )
+        # Fire-and-forget shadow sampling on cross-run hits. Mirrors the
+        # in-run path above; uses the -1.0 cached_age_seconds sentinel
+        # because the Redis tier does not track per-key write time.
+        if task.workflow_run_id is not None:
+            _schedule_extraction_shadow_check_for_hit(
+                task=task,
+                workflow_run_id=task.workflow_run_id,
+                cache_key=cache_key,
+                cached_value=cross_run_value,
+                cached_age_seconds=extraction_shadow.UNKNOWN_CACHE_AGE_SENTINEL,
+                scraped_page=scraped_page,
+                llm_key_override=llm_key_override,
+                extract_information_prompt=extract_information_prompt,
+            )
+        return ScrapeResult(scraped_data=cross_run_value)
+
+    # Cross-run miss log — INFO so the wpid-tier hit rate is computable
+    # from logs alone once the read flag starts ramping. Earlier drafts kept
+    # this at DEBUG specifically to avoid flooding INFO during the
+    # post-merge 0%-read window; promoted to INFO in SKY-8992 before the
+    # first read-flag flip so Datadog has both sides of the ratio without a
+    # log-level backfill.
+    if cache_key is not None and not is_retry_step and cross_run_value is None:
+        LOG.info(
+            "extract_information cache miss (cross-run)",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            cache_key=cache_key,
+            cache_hit=False,
+            cache_scope=extraction_cache.SCOPE_WPID,
+            cache_age_seconds=None,
+            # The wpid tier doesn't distinguish "flag disabled" from
+            # "key not found" at the handler — both surface as ``None`` —
+            # so label as ``cross_run_miss`` and let downstream metrics
+            # split by ``workflow_permanent_id`` populated vs empty.
+            fallback_reason="cross_run_miss",
+            cache_path="handler",
+        )
+
     # Use the appropriate LLM handler based on the feature flag
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
         llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
@@ -4453,6 +5270,7 @@ async def extract_information_for_navigation_goal(
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
         force_dict=False,
+        system_prompt=task.workflow_system_prompt,
     )
 
     # Validate and fill missing fields based on schema
@@ -4467,11 +5285,50 @@ async def extract_information_for_navigation_goal(
     # dict / list / str — the `extract-information` prompt uses
     # `force_dict=False`, so root `type: array` or scalar schemas are valid
     # return shapes (matches ``ScrapeResult.scraped_data``).
+    # TEMPORARY INSTRUMENTATION (SKY-8992): the dual-write block below appears
+    # to never populate Redis in production despite the code being deployed
+    # and the cloud override verified. Log the gate inputs every call so we
+    # can see which guard is closing the block. Revert after root-cause is
+    # identified.
+    LOG.info(
+        "extract_information cache store gate",
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        workflow_permanent_id=task.workflow_permanent_id,
+        cache_key_present=cache_key is not None,
+        json_response_type=type(json_response).__name__,
+        json_response_is_cacheable=isinstance(json_response, (dict, list, str)),
+        cache_path="handler",
+    )
     if cache_key is not None and isinstance(json_response, (dict, list, str)):
+        # TEMPORARY INSTRUMENTATION (SKY-8992): confirm the dual-write block is entered.
+        LOG.info(
+            "extract_information cache store block entered",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=task.workflow_permanent_id,
+            cache_key=cache_key,
+            cache_path="handler",
+        )
         try:
             extraction_cache.store(task.workflow_run_id, cache_key, json_response)
         except Exception:
             LOG.warning("extract_information cache store failed; ignoring", exc_info=True)
+        # Dual-write to the cross-run (Redis) tier. Ungated so the cache is
+        # warm before the read flag rolls out. OSS returns immediately; cloud
+        # writes to Redis with a long TTL and swallows backend errors.
+        try:
+            await app.AGENT_FUNCTION.store_cross_run_extraction_cache(wpid_for_cache, cache_key, json_response)
+        except Exception:
+            LOG.warning(
+                "extract_information cross-run cache store raised; ignoring",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=task.workflow_permanent_id,
+                organization_id=task.organization_id,
+                cache_key=cache_key,
+                exc_info=True,
+            )
 
     return ScrapeResult(
         scraped_data=json_response,
@@ -4603,11 +5460,45 @@ async def _get_input_or_select_context(
 
     json_response["intention"] = action.intention
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
-    LOG.info(
+    LOG.debug(
         "Parsed input/select context",
         context=input_or_select_context,
     )
     return input_or_select_context
+
+
+def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: str) -> list[UserDefinedError]:
+    # If the LLM returns no structured errors but its terminate reasoning
+    # explicitly mentions a configured code or description, preserve that
+    # machine-readable code for task/run/webhook error aggregation.
+    normalized_reasoning = reasoning.lower()
+    matched_errors: list[UserDefinedError] = []
+    for error_code, error_description in (task.error_code_mapping or {}).items():
+        # Only match structured codes directly. Generic single-word codes like
+        # "timeout" can appear in unrelated reasoning and look falsely authoritative.
+        code_matches = (
+            "_" in error_code and re.search(rf"\b{re.escape(error_code.lower())}\b", normalized_reasoning) is not None
+        )
+        description_matches = isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        if code_matches or description_matches:
+            matched_errors.append(
+                UserDefinedError(
+                    error_code=error_code,
+                    reasoning=reasoning,
+                    confidence_float=1.0,
+                )
+            )
+    if matched_errors:
+        if len(matched_errors) > 1:
+            LOG.warning(
+                "Multiple user-defined error mappings matched terminate reasoning; using first match",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                matched_error_codes=[error.error_code for error in matched_errors],
+                selected_error_code=matched_errors[0].error_code,
+            )
+        return [matched_errors[0]]
+    return []
 
 
 async def extract_user_defined_errors(
@@ -4632,4 +5523,16 @@ async def extract_user_defined_errors(
         step=step,
         prompt_name="surface-user-defined-errors",
     )
-    return [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
+    parsed = [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
+    kept, dropped = filter_to_user_defined_codes(parsed, task.error_code_mapping)
+    if dropped:
+        LOG.warning(
+            "Dropped LLM-returned error codes not in user error_code_mapping",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            dropped_codes=dropped,
+            allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+        )
+    if not kept and reasoning:
+        return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
+    return kept

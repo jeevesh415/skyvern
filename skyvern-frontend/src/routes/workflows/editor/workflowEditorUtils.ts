@@ -9,8 +9,10 @@ import {
   WorkflowBlockTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
+  BranchCriteriaTypes,
   debuggableWorkflowBlockTypes,
   type AWSSecretParameter,
+  type BranchCriteriaType,
   type OutputParameter,
   type Parameter,
   type WorkflowApiResponse,
@@ -18,6 +20,8 @@ import {
   type WorkflowSettings,
   type ConditionalBlock,
   type ForLoopBlock,
+  type WhileLoopBlock,
+  isNestedLoopWorkflowBlock,
 } from "../types/workflowTypes";
 import {
   ActionBlockYAML,
@@ -27,6 +31,7 @@ import {
   DownloadToS3BlockYAML,
   FileUrlParserBlockYAML,
   ForLoopBlockYAML,
+  WhileLoopBlockYAML,
   ParameterYAML,
   SendEmailBlockYAML,
   TaskBlockYAML,
@@ -47,6 +52,8 @@ import {
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
+  GoogleSheetsReadBlockYAML,
+  GoogleSheetsWriteBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -140,6 +147,74 @@ import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
 } from "./nodes/WorkflowTriggerNode/types";
+import {
+  googleSheetsReadNodeDefaultData,
+  isGoogleSheetsReadNode,
+} from "./nodes/GoogleSheetsReadNode/types";
+import { validateGoogleSheetsReadNode } from "./nodes/GoogleSheetsReadNode/validate";
+import {
+  googleSheetsWriteNodeDefaultData,
+  isGoogleSheetsWriteNode,
+} from "./nodes/GoogleSheetsWriteNode/types";
+import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
+
+/** If the trimmed expression is exactly one `{{ ... }}` wrapper, use `jinja2_template`; otherwise `prompt`. */
+export function inferBranchCriteriaTypeFromExpression(
+  expression: string,
+): BranchCriteriaType {
+  const stripped = expression.trim();
+  const openCount = (stripped.match(/\{\{/g) ?? []).length;
+  if (stripped.startsWith("{{") && stripped.endsWith("}}") && openCount === 1) {
+    return BranchCriteriaTypes.Jinja2Template;
+  }
+  return BranchCriteriaTypes.Prompt;
+}
+
+function buildWhileLoopBlockYAML(args: {
+  label: string;
+  continue_on_failure: boolean;
+  next_loop_on_failure: boolean;
+  next_block_label: string | null;
+  ignore_workflow_system_prompt: boolean;
+  loop_blocks: Array<BlockYAML>;
+  criteria_type: BranchCriteriaType;
+  expression: string;
+  description: string | null;
+}): WhileLoopBlockYAML {
+  return {
+    block_type: "while_loop",
+    label: args.label,
+    continue_on_failure: args.continue_on_failure,
+    next_loop_on_failure: args.next_loop_on_failure,
+    next_block_label: args.next_block_label,
+    ignore_workflow_system_prompt: args.ignore_workflow_system_prompt,
+    loop_blocks: args.loop_blocks,
+    condition: {
+      criteria_type: args.criteria_type,
+      expression: args.expression,
+      description: args.description,
+    },
+  };
+}
+
+function serializeLoopNodeWhileBranchToYAML(
+  node: LoopNode,
+  loopChildren: Array<BlockYAML>,
+  nextBlockLabel: string | null,
+): WhileLoopBlockYAML {
+  return buildWhileLoopBlockYAML({
+    label: node.data.label,
+    continue_on_failure: node.data.continueOnFailure,
+    next_loop_on_failure: node.data.nextLoopOnFailure ?? false,
+    next_block_label: nextBlockLabel,
+    ignore_workflow_system_prompt:
+      node.data.ignoreWorkflowSystemPrompt ?? false,
+    loop_blocks: loopChildren,
+    criteria_type: node.data.whileConditionCriteriaType,
+    expression: node.data.whileConditionExpression,
+    description: node.data.whileConditionDescription ?? null,
+  });
+}
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -536,6 +611,7 @@ function convertToNode(
     nextLoopOnFailure: block.next_loop_on_failure,
     editable,
     model: block.model,
+    ignoreWorkflowSystemPrompt: block.ignore_workflow_system_prompt ?? false,
   };
   switch (block.block_type) {
     case "conditional": {
@@ -842,7 +918,9 @@ function convertToNode(
         ...common,
         type: "loop",
         data: {
+          ...loopNodeDefaultData,
           ...commonData,
+          loopKind: "for_each",
           loopValue: block.loop_over?.key ?? "",
           loopVariableReference: loopVariableReference,
           completeIfEmpty: block.complete_if_empty,
@@ -856,6 +934,32 @@ function convertToNode(
         },
       };
     }
+    case "while_loop": {
+      const wblock = block as WhileLoopBlock;
+      const rawExpr = wblock.condition.expression;
+      const whileConditionExpression =
+        rawExpr.trim() === "" ? "{{ true }}" : rawExpr;
+      return {
+        ...identifiers,
+        ...common,
+        type: "loop",
+        data: {
+          ...loopNodeDefaultData,
+          ...commonData,
+          loopKind: "while",
+          loopValue: "",
+          loopVariableReference: "",
+          completeIfEmpty: false,
+          dataSchema: "null",
+          whileConditionExpression,
+          whileConditionDescription: wblock.condition.description ?? null,
+          whileConditionCriteriaType:
+            rawExpr.trim() === ""
+              ? inferBranchCriteriaTypeFromExpression(whileConditionExpression)
+              : wblock.condition.criteria_type,
+        },
+      };
+    }
     case "file_url_parser": {
       return {
         ...identifiers,
@@ -864,6 +968,7 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
+          fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           model: block.model,
         },
@@ -992,6 +1097,43 @@ function convertToNode(
         },
       };
     }
+    case "google_sheets_read": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsRead",
+        data: {
+          ...commonData,
+          spreadsheetUrl: block.spreadsheet_url ?? "",
+          sheetName: block.sheet_name ?? "",
+          range: block.range ?? "",
+          credentialId: block.credential_id ?? "",
+          hasHeaderRow: block.has_header_row ?? true,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "google_sheets_write": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsWrite",
+        data: {
+          ...commonData,
+          spreadsheetUrl: block.spreadsheet_url ?? "",
+          sheetName: block.sheet_name ?? "",
+          range: block.range ?? "",
+          credentialId: block.credential_id ?? "",
+          writeMode: block.write_mode ?? "append",
+          values: block.values ?? "",
+          columnMapping: block.column_mapping
+            ? JSON.stringify(block.column_mapping, null, 2)
+            : "",
+          createSheetIfMissing: block.create_sheet_if_missing ?? false,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
   }
 }
 
@@ -1045,7 +1187,7 @@ function generateNodeData(blocks: Array<WorkflowBlock>): Array<{
     const block = stack.pop()!;
     const id = nanoid();
     idMap.set(block, id);
-    if (block.block_type === "for_loop") {
+    if (isNestedLoopWorkflowBlock(block)) {
       stack.push(...block.loop_blocks);
     }
   }
@@ -1078,7 +1220,7 @@ function getNodeData(
     const next =
       index === blocks.length - 1 ? null : ids.get(blocks[index + 1]!)!;
     data.push({ id, previous, next, parentId, block });
-    if (block.block_type === "for_loop") {
+    if (isNestedLoopWorkflowBlock(block)) {
       data.push(...getNodeData(block.loop_blocks, ids, id));
     }
   });
@@ -1094,7 +1236,7 @@ function buildLabelToBlockMap(
   const traverse = (list: Array<WorkflowBlock>) => {
     list.forEach((block) => {
       map.set(block.label, block);
-      if (block.block_type === "for_loop") {
+      if (isNestedLoopWorkflowBlock(block)) {
         traverse(block.loop_blocks);
       }
     });
@@ -1165,7 +1307,7 @@ function reconstructConditionalStructure(
   // Process each conditional block
   blocks.forEach((block, blockIndex) => {
     if (block.block_type !== "conditional") {
-      if (block.block_type === "for_loop") {
+      if (isNestedLoopWorkflowBlock(block)) {
         // Recursively handle conditionals inside loops
         const recursiveResult = reconstructConditionalStructure(
           block.loop_blocks,
@@ -1530,6 +1672,7 @@ function getElements(
     startNode(startNodeId, {
       withWorkflowSettings: true,
       persistBrowserSession: settings.persistBrowserSession,
+      browserProfileId: settings.browserProfileId,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
@@ -1545,6 +1688,7 @@ function getElements(
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
+      workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
     }),
   );
 
@@ -1567,8 +1711,8 @@ function getElements(
   });
 
   const loopBlocks = data.filter(
-    (d): d is typeof d & { block: ForLoopBlock } =>
-      d.block.block_type === "for_loop",
+    (d): d is typeof d & { block: ForLoopBlock | WhileLoopBlock } =>
+      isNestedLoopWorkflowBlock(d.block),
   );
   loopBlocks.forEach((block) => {
     const loopBlock = block.block;
@@ -1608,7 +1752,7 @@ function getElements(
             ).forEach((label) => branchLabels.add(label));
           });
         }
-        if (child.block_type === "for_loop") {
+        if (isNestedLoopWorkflowBlock(child)) {
           collectBranchLabels(child.loop_blocks);
         }
       });
@@ -2095,6 +2239,28 @@ function createNode(
         },
       };
     }
+    case "googleSheetsRead": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsRead",
+        data: {
+          ...googleSheetsReadNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "googleSheetsWrite": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "googleSheetsWrite",
+        data: {
+          ...googleSheetsWriteNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "conditional": {
       const branches = createDefaultBranchConditions();
       return {
@@ -2131,6 +2297,35 @@ function JSONSafeOrString(
   } catch {
     return json;
   }
+}
+
+function serializeLoopNodeToYAML(
+  node: LoopNode,
+  loopChildren: Array<BlockYAML>,
+  nextBlockLabel: string | null,
+): ForLoopBlockYAML | WhileLoopBlockYAML {
+  const loopKind = node.data.loopKind;
+  if (loopKind === "while") {
+    return serializeLoopNodeWhileBranchToYAML(
+      node,
+      loopChildren,
+      nextBlockLabel,
+    );
+  }
+  return {
+    label: node.data.label,
+    continue_on_failure: node.data.continueOnFailure,
+    next_loop_on_failure: node.data.nextLoopOnFailure ?? false,
+    next_block_label: nextBlockLabel,
+    ignore_workflow_system_prompt:
+      node.data.ignoreWorkflowSystemPrompt ?? false,
+    loop_blocks: loopChildren,
+    block_type: "for_loop",
+    loop_variable_reference: node.data.loopVariableReference,
+    complete_if_empty: node.data.completeIfEmpty,
+    data_schema: JSONSafeOrString(node.data.dataSchema),
+    loop_over_parameter_key: node.data.loopValue ?? "",
+  };
 }
 
 function findNextBlockLabel(
@@ -2238,6 +2433,8 @@ function getWorkflowBlock(
     next_loop_on_failure: node.data.nextLoopOnFailure,
     model: node.data.model,
     next_block_label: nextBlockLabel,
+    ignore_workflow_system_prompt:
+      node.data.ignoreWorkflowSystemPrompt ?? false,
   };
   switch (node.type) {
     case "task": {
@@ -2511,7 +2708,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
-        file_type: "csv", // Backend will auto-detect based on file extension
+        file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
@@ -2600,6 +2797,41 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
       };
     }
+    case "googleSheetsRead": {
+      return {
+        ...base,
+        block_type: "google_sheets_read",
+        spreadsheet_url: node.data.spreadsheetUrl,
+        sheet_name: node.data.sheetName || null,
+        range: node.data.range || null,
+        credential_id: node.data.credentialId || null,
+        has_header_row: node.data.hasHeaderRow,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "googleSheetsWrite": {
+      let parsedColumnMapping: Record<string, string> | null = null;
+      if (node.data.columnMapping) {
+        try {
+          parsedColumnMapping = JSON.parse(node.data.columnMapping);
+        } catch {
+          // ignore invalid JSON
+        }
+      }
+      return {
+        ...base,
+        block_type: "google_sheets_write",
+        spreadsheet_url: node.data.spreadsheetUrl,
+        sheet_name: node.data.sheetName || null,
+        range: node.data.range || null,
+        credential_id: node.data.credentialId || null,
+        write_mode: node.data.writeMode,
+        values: node.data.values,
+        column_mapping: parsedColumnMapping,
+        create_sheet_if_missing: node.data.createSheetIfMissing,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
     case "conditional": {
       return serializeConditionalBlock(node as ConditionalNode, nodes, edges);
     }
@@ -2673,17 +2905,13 @@ function getOrderedChildrenBlocks(
       );
       // Compute next_block_label for nested loops (same as regular blocks)
       const nextBlockLabel = findNextBlockLabel(currentNode.id, nodes, edges);
-      children.push({
-        block_type: "for_loop",
-        label: currentNode.data.label,
-        continue_on_failure: currentNode.data.continueOnFailure,
-        next_loop_on_failure: currentNode.data.nextLoopOnFailure,
-        next_block_label: nextBlockLabel,
-        loop_blocks: loopChildren,
-        loop_variable_reference: currentNode.data.loopVariableReference,
-        complete_if_empty: currentNode.data.completeIfEmpty,
-        data_schema: JSONSafeOrString(currentNode.data.dataSchema),
-      });
+      children.push(
+        serializeLoopNodeToYAML(
+          currentNode as LoopNode,
+          loopChildren,
+          nextBlockLabel,
+        ),
+      );
     } else {
       children.push(getWorkflowBlock(currentNode, nodes, edges));
     }
@@ -2712,17 +2940,9 @@ function getOrderedChildrenBlocks(
     if (node.type === "loop") {
       const loopChildren = getOrderedChildrenBlocks(nodes, edges, node.id);
       const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
-      children.push({
-        block_type: "for_loop",
-        label: node.data.label,
-        continue_on_failure: node.data.continueOnFailure,
-        next_loop_on_failure: node.data.nextLoopOnFailure,
-        next_block_label: nextBlockLabel,
-        loop_blocks: loopChildren,
-        loop_variable_reference: node.data.loopVariableReference,
-        complete_if_empty: node.data.completeIfEmpty,
-        data_schema: JSONSafeOrString(node.data.dataSchema),
-      });
+      children.push(
+        serializeLoopNodeToYAML(node as LoopNode, loopChildren, nextBlockLabel),
+      );
       includedIds.add(node.id);
       return;
     }
@@ -2778,17 +2998,11 @@ function getWorkflowBlocksUtil(
       const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
 
       return [
-        {
-          block_type: "for_loop",
-          label: node.data.label,
-          continue_on_failure: node.data.continueOnFailure,
-          next_loop_on_failure: node.data.nextLoopOnFailure,
-          next_block_label: nextBlockLabel,
-          loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
-          loop_variable_reference: node.data.loopVariableReference,
-          complete_if_empty: node.data.completeIfEmpty,
-          data_schema: JSONSafeOrString(node.data.dataSchema),
-        },
+        serializeLoopNodeToYAML(
+          node as LoopNode,
+          getOrderedChildrenBlocks(nodes, edges, node.id),
+          nextBlockLabel,
+        ),
       ];
     }
     return [getWorkflowBlock(node as WorkflowBlockNode, nodes, edges)];
@@ -2805,6 +3019,7 @@ function getWorkflowBlocks(
 function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const defaultSettings = {
     persistBrowserSession: false,
+    browserProfileId: null,
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: null,
     model: null,
@@ -2817,6 +3032,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     runSequentially: false,
     sequentialKey: null,
     finallyBlockLabel: null,
+    workflowSystemPrompt: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -2829,6 +3045,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   if (isWorkflowStartNodeData(data)) {
     return {
       persistBrowserSession: data.persistBrowserSession,
+      browserProfileId: data.browserProfileId,
       proxyLocation: data.proxyLocation,
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
@@ -2844,6 +3061,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
       finallyBlockLabel: data.finallyBlockLabel ?? null,
+      workflowSystemPrompt: data.workflowSystemPrompt ?? null,
     };
   }
   return defaultSettings;
@@ -3398,7 +3616,10 @@ function getBlocksOfType(
 ): Array<BlockYAML> {
   const blocksOfType: Array<BlockYAML> = [];
   for (const block of blocks) {
-    if (block.block_type === WorkflowBlockTypes.ForLoop) {
+    if (
+      block.block_type === WorkflowBlockTypes.ForLoop ||
+      block.block_type === WorkflowBlockTypes.WhileLoop
+    ) {
       const subBlocks = block.loop_blocks;
       const subBlocksOfType = getBlocksOfType(subBlocks, blockType);
       blocksOfType.push(...subBlocksOfType);
@@ -3662,11 +3883,10 @@ export function upgradeWorkflowBlocksV1toV2(
     };
 
     // Recursively handle loop blocks
-    if (block.block_type === "for_loop") {
-      const loopBlock = block as ForLoopBlock;
+    if (isNestedLoopWorkflowBlock(block)) {
       return {
         ...upgradedBlock,
-        loop_blocks: upgradeWorkflowBlocksV1toV2(loopBlock.loop_blocks),
+        loop_blocks: upgradeWorkflowBlocksV1toV2(block.loop_blocks),
       } as WorkflowBlock;
     }
 
@@ -3697,6 +3917,8 @@ function convertBlocksToBlockYAML(
       continue_on_failure: block.continue_on_failure,
       next_loop_on_failure: block.next_loop_on_failure,
       next_block_label: block.next_block_label,
+      ignore_workflow_system_prompt:
+        block.ignore_workflow_system_prompt ?? false,
     };
     switch (block.block_type) {
       case "task": {
@@ -3901,6 +4123,20 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "while_loop": {
+        const wblock = block as WhileLoopBlock;
+        const blockYaml: WhileLoopBlockYAML = {
+          ...base,
+          block_type: "while_loop",
+          loop_blocks: convertBlocksToBlockYAML(wblock.loop_blocks),
+          condition: {
+            criteria_type: wblock.condition.criteria_type,
+            expression: wblock.condition.expression,
+            description: wblock.condition.description ?? null,
+          },
+        };
+        return blockYaml;
+      }
       case "code": {
         const blockYaml: CodeBlockYAML = {
           ...base,
@@ -4038,6 +4274,35 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "google_sheets_read": {
+        const blockYaml: GoogleSheetsReadBlockYAML = {
+          ...base,
+          block_type: "google_sheets_read",
+          spreadsheet_url: block.spreadsheet_url,
+          sheet_name: block.sheet_name,
+          range: block.range,
+          credential_id: block.credential_id,
+          has_header_row: block.has_header_row,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "google_sheets_write": {
+        const blockYaml: GoogleSheetsWriteBlockYAML = {
+          ...base,
+          block_type: "google_sheets_write",
+          spreadsheet_url: block.spreadsheet_url,
+          sheet_name: block.sheet_name,
+          range: block.range,
+          credential_id: block.credential_id,
+          write_mode: block.write_mode,
+          values: block.values,
+          column_mapping: block.column_mapping,
+          create_sheet_if_missing: block.create_sheet_if_missing,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -4053,6 +4318,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
     persist_browser_session: workflow.persist_browser_session,
+    browser_profile_id: workflow.browser_profile_id ?? null,
     model: workflow.model,
     totp_verification_url: workflow.totp_verification_url,
     max_screenshot_scrolls: workflow.max_screenshot_scrolls,
@@ -4062,6 +4328,8 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
       finally_block_label: workflow.workflow_definition.finally_block_label,
+      workflow_system_prompt:
+        workflow.workflow_definition.workflow_system_prompt,
     },
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
@@ -4101,12 +4369,24 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   // check loop node parameters
   const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
-  const emptyLoopNodes = loopNodes.filter(
-    (node: LoopNode) => node.data.loopVariableReference === "",
+  const emptyForEachLoops = loopNodes.filter(
+    (node: LoopNode) =>
+      node.data.loopKind === "for_each" &&
+      node.data.loopVariableReference === "",
   );
-  if (emptyLoopNodes.length > 0) {
-    emptyLoopNodes.forEach((node) => {
+  if (emptyForEachLoops.length > 0) {
+    emptyForEachLoops.forEach((node) => {
       errors.push(`${node.data.label}: Loop value is required.`);
+    });
+  }
+  const whileLoopsMissingCondition = loopNodes.filter(
+    (node: LoopNode) =>
+      node.data.loopKind === "while" &&
+      node.data.whileConditionExpression.trim() === "",
+  );
+  if (whileLoopsMissingCondition.length > 0) {
+    whileLoopsMissingCondition.forEach((node) => {
+      errors.push(`${node.data.label}: While loop condition is required.`);
     });
   }
 
@@ -4286,6 +4566,14 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
   });
 
+  nodes
+    .filter(isGoogleSheetsReadNode)
+    .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
+
+  nodes
+    .filter(isGoogleSheetsWriteNode)
+    .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
+
   return errors;
 }
 
@@ -4334,6 +4622,24 @@ function isNodeInsideForLoop(nodes: Array<AppNode>, nodeId: string): boolean {
   return false;
 }
 
+function getParentLoopSkipsOnFail(
+  nodes: Array<AppNode>,
+  nodeId: string,
+): boolean {
+  const currentNode = nodes.find((n) => n.id === nodeId);
+  if (!currentNode) return false;
+  let current: AppNode | undefined = currentNode;
+  while (current?.parentId) {
+    const parent = nodes.find((n) => n.id === current!.parentId);
+    if (parent?.type === "loop") {
+      const data = parent.data as { nextLoopOnFailure?: boolean };
+      return data.nextLoopOnFailure === true;
+    }
+    current = parent;
+  }
+  return false;
+}
+
 export {
   containsJinjaReference,
   convert,
@@ -4361,6 +4667,7 @@ export {
   getWorkflowBlocks,
   getWorkflowErrors,
   isNodeInsideForLoop,
+  getParentLoopSkipsOnFail,
   isOutputParameterKey,
   layout,
   removeJinjaReferenceFromNodes,

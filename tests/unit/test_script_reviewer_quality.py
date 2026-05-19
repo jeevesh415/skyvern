@@ -1,6 +1,29 @@
 """Tests for ScriptReviewer quality validators: proactive misuse, fragile selectors, hardcoded run data."""
 
+from pathlib import Path
+
 from skyvern.services.script_reviewer import ScriptReviewer
+
+_PROMPT_PATH = Path(__file__).resolve().parents[2] / "skyvern" / "forge" / "prompts" / "skyvern" / "script-reviewer.j2"
+
+
+class TestSelectorReplacementGuidance:
+    """Pin Rule 8b's multi-row form guidance against accidental deletion."""
+
+    def test_rule_8b_covers_multi_row_full_block_case(self) -> None:
+        # Assert on key concepts rather than exact wording so the rule can be
+        # rephrased without breaking the test. The invariants are: (1) multi-row
+        # forms are called out somewhere in the prompt, (2) the `full_block`
+        # episode case is covered, (3) the prescribed action is removal, not
+        # accumulation.
+        text = _PROMPT_PATH.read_text(encoding="utf-8")
+        assert "multi-row" in text.lower()
+        assert "full_block" in text
+        # The fix's whole point: REMOVE (not just dedupe) the ambiguous label
+        # selector. Case-sensitive — the prompt uses upper-case REMOVE as a
+        # directive marker.
+        assert "REMOVE" in text
+        assert "label:has-text" in text
 
 
 class TestValidateProactiveMisuse:
@@ -61,6 +84,27 @@ async def block_fn(page, context):
     result = await page.extract(prompt='Get the invoice data', ai='proactive')
 """
         # extract is not in _INTERACTION_METHODS, so this should pass
+        assert self.reviewer._validate_proactive_misuse(code) is None
+
+    def test_proactive_without_selector_not_flagged(self) -> None:
+        """ai='proactive' WITHOUT selector= is the documented escape hatch (SKY-9436).
+
+        It is intentional and runtime-safe (always invokes LLM, no
+        `selector: expected string` crash). Only flag when paired with selector=.
+        """
+        code = """
+async def block_fn(page, context):
+    await page.click(ai='proactive', prompt='Click the next-step button')
+    await page.fill(value='hello', ai='proactive', prompt='Fill the field')
+"""
+        assert self.reviewer._validate_proactive_misuse(code) is None
+
+    def test_selector_inside_prompt_does_not_falsely_flag(self) -> None:
+        """Regression: prompt text containing 'selector=' must not make a proactive call look like proactive-with-selector (CORR-3)."""
+        code = """
+async def block_fn(page, context):
+    await page.click(ai='proactive', prompt='No selector= available for this widget')
+"""
         assert self.reviewer._validate_proactive_misuse(code) is None
 
     def test_comments_ignored(self) -> None:
@@ -467,8 +511,8 @@ async def block_1(page, context):
 """
         result = extract_cached_blocks_from_source(source)
         assert set(result.keys()) == {"login", "block_1"}
-        assert "page.goto" in result["login"]
-        assert "page.click" in result["block_1"]
+        assert "page.goto" in result["login"]  # nosemgrep: incomplete-url-substring-sanitization
+        assert "page.click" in result["block_1"]  # nosemgrep: incomplete-url-substring-sanitization
         # login block should NOT contain block_1 code
         assert "page.click" not in result["login"]
 
@@ -488,7 +532,7 @@ async def block_1(page, context):
 """
         result = extract_single_cached_block(source, "block_1")
         assert result is not None
-        assert "page.click" in result
+        assert "page.click" in result  # nosemgrep: incomplete-url-substring-sanitization
         assert "page.goto" not in result
 
     def test_extract_first_block(self):
@@ -507,7 +551,7 @@ async def block_1(page, context):
 """
         result = extract_single_cached_block(source, "login")
         assert result is not None
-        assert "page.goto" in result
+        assert "page.goto" in result  # nosemgrep: incomplete-url-substring-sanitization
         assert "page.click" not in result
 
     def test_extract_single_block_not_found(self):

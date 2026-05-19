@@ -15,6 +15,7 @@ from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.video_utils import finalize_webm
 
 LOG = structlog.get_logger()
 
@@ -115,8 +116,13 @@ class RealBrowserManager(BrowserManager):
 
         if browser_state is None:
             LOG.info("Creating browser state for task", task_id=task.task_id)
+            proxy_location = task.proxy_location
+            if browser_session_id and task.organization_id:
+                session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, task.organization_id)
+                if session and session.proxy_location is not None:
+                    proxy_location = session.proxy_location
             browser_state = await self._create_browser_state(
-                proxy_location=task.proxy_location,
+                proxy_location=proxy_location,
                 url=task.url,
                 task_id=task.task_id,
                 workflow_permanent_id=task.workflow_permanent_id,
@@ -210,8 +216,15 @@ class RealBrowserManager(BrowserManager):
                 "Creating browser state for workflow run",
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+            proxy_location = workflow_run.proxy_location
+            if browser_session_id and workflow_run.organization_id:
+                session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+                    browser_session_id, workflow_run.organization_id
+                )
+                if session and session.proxy_location is not None:
+                    proxy_location = session.proxy_location
             browser_state = await self._create_browser_state(
-                proxy_location=workflow_run.proxy_location,
+                proxy_location=proxy_location,
                 url=url,
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
@@ -279,6 +292,7 @@ class RealBrowserManager(BrowserManager):
         task_id: str = "",
         workflow_id: str = "",
         workflow_run_id: str = "",
+        finalize: bool = True,
     ) -> list[VideoArtifact]:
         if len(browser_state.browser_artifacts.video_artifacts) == 0:
             LOG.warning(
@@ -292,8 +306,15 @@ class RealBrowserManager(BrowserManager):
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
-                with open(path, "rb") as f:
-                    browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                if finalize:
+                    # Remux via ffmpeg so the WebM container has a valid Duration + Cues,
+                    # even when browser_context.close() was killed mid-finalization.
+                    browser_state.browser_artifacts.video_artifacts[i].video_data = await finalize_webm(path)
+                else:
+                    # Per-step snapshot while recording is still open — skip ffmpeg: the file is
+                    # partial, so remux would either fail or be thrown away by the final pass.
+                    with open(path, "rb") as f:
+                        browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
             else:
                 LOG.debug(
                     "Video path not found",

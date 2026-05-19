@@ -4,6 +4,12 @@ from typing import Any, Protocol
 
 from skyvern.config import settings
 
+# Sentinel for the optional ``system_prompt`` parameter on ``ai_extract``.
+# Distinguishes "caller omitted the argument" (resolve from workflow context,
+# honoring the current block's ``ignore_workflow_system_prompt`` flag) from
+# "caller passed None" (opt out, send no system prompt).
+SYSTEM_PROMPT_UNSET: Any = object()
+
 
 class SkyvernPageAi(Protocol):
     """Protocol defining the interface for AI-powered page interactions."""
@@ -16,6 +22,7 @@ class SkyvernPageAi(Protocol):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         failed_selector: str | None = None,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> str | None:
         """Click an element using AI to locate it based on intention."""
         ...
@@ -31,6 +38,7 @@ class SkyvernPageAi(Protocol):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         failed_selector: str | None = None,
         block_label: str | None = None,
+        recoverable_marker_id: int | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
         ...
@@ -67,6 +75,7 @@ class SkyvernPageAi(Protocol):
         data: str | dict[str, Any] | None = None,
         skip_refresh: bool = False,
         include_extracted_text: bool = True,
+        system_prompt: str | None | Any = SYSTEM_PROMPT_UNSET,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
         ...
@@ -114,12 +123,17 @@ class SkyvernPageAi(Protocol):
     async def ai_element_fallback(
         self,
         navigation_goal: str,
-        max_steps: int = 10,
+        max_steps: int = 5,
+        validate_first: bool = False,
     ) -> None:
         """Activate the AI agent from the CURRENT page position to achieve a navigation goal.
 
         This is a mid-block fallback that picks up from the current page state
         instead of re-running the entire block from scratch.
+
+        ``validate_first=True`` re-enables the legacy pre-act validate on
+        iteration 0 for defensive callers that may invoke this when the page
+        already satisfies the goal.
         """
         ...
 

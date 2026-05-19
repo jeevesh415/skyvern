@@ -1,7 +1,10 @@
 import asyncio
 import json
+import time
+import unicodedata
 from enum import Enum
 from typing import Annotated, Any
+from urllib.parse import quote
 
 import structlog
 import yaml
@@ -26,6 +29,7 @@ from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.analytics import get_oss_version
 from skyvern.config import settings
+from skyvern.constants import SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import (
     MissingBrowserAddressError,
     SkyvernHTTPException,
@@ -34,12 +38,18 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.artifact.signing import ARTIFACT_URL_EXPIRY_SECONDS, parse_keyring, verify_artifact_signature
+from skyvern.forge.sdk.artifact.signing import (
+    ARTIFACT_URL_EXPIRY_SECONDS,
+    ARTIFACT_URL_EXPIRY_SECONDS_MAX,
+    ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    parse_keyring,
+    verify_artifact_signature,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -122,7 +132,7 @@ from skyvern.schemas.runs import (
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
-from skyvern.schemas.webhooks import RetryRunWebhookRequest
+from skyvern.schemas.webhooks import RetryRunWebhookRequest, RunWebhookReplayResponse
 from skyvern.schemas.workflows import (
     BlockType,
     WorkflowCreateYAMLRequest,
@@ -132,10 +142,12 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
-from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+FORCE_TASK_V1_MAX_STEPS = 25
 
 _create_from_prompt_adapter: TypeAdapter[CreateFromPromptRequest] = TypeAdapter(CreateFromPromptRequest)
 
@@ -178,6 +190,39 @@ async def run_task(
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
+
+    skyvern_ctx = skyvern_context.current()
+    # Per-request distinct_id makes the TTLCache effectively single-use here; that's the
+    # price of true %-rollout randomization on a flag that's only checked once per request.
+    force_task_v1_distinct_id = (
+        skyvern_ctx.request_id if skyvern_ctx and skyvern_ctx.request_id else current_org.organization_id
+    )
+    if (
+        run_request.engine == RunEngine.skyvern_v2
+        and not run_request.publish_workflow
+        and await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "FORCE_TASK_V1",
+            force_task_v1_distinct_id,
+            properties={"organization_id": current_org.organization_id},
+        )
+    ):
+        cap = FORCE_TASK_V1_MAX_STEPS
+        if current_org.max_steps_per_run is not None:
+            cap = min(cap, current_org.max_steps_per_run)
+        log_extra: dict[str, Any] = {}
+        if run_request.run_with:
+            log_extra["dropped_run_with"] = run_request.run_with
+        LOG.info(
+            "FORCE_TASK_V1 flag set; routing to v1 engine",
+            organization_id=current_org.organization_id,
+            requested_max_steps=run_request.max_steps,
+            org_max_steps_per_run=current_org.max_steps_per_run,
+            effective_cap=cap,
+            **log_extra,
+        )
+        run_request.engine = RunEngine.skyvern_v1
+        if not run_request.max_steps or run_request.max_steps > cap:
+            run_request.max_steps = cap
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
@@ -265,6 +310,9 @@ async def run_task(
         )
     if run_request.engine == RunEngine.skyvern_v2:
         # create task v2
+        v2_trigger_type = (
+            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+        )
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=current_org,
@@ -274,6 +322,7 @@ async def run_task(
                 totp_verification_url=run_request.totp_url,
                 webhook_callback_url=run_request.webhook_url,
                 proxy_location=run_request.proxy_location,
+                trigger_type=v2_trigger_type,
                 publish_workflow=run_request.publish_workflow,
                 extracted_information_schema=run_request.data_extraction_schema,
                 error_code_mapping=run_request.error_code_mapping,
@@ -393,8 +442,10 @@ async def run_workflow(
         browser_address=workflow_run_request.browser_address,
         run_with=workflow_run_request.run_with,
         ai_fallback=workflow_run_request.ai_fallback,
+        run_metadata=workflow_run_request.run_metadata,
     )
 
+    trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -407,6 +458,7 @@ async def run_workflow(
             request_id=request_id,
             request=request,
             background_tasks=background_tasks,
+            trigger_type=trigger_type,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -549,8 +601,8 @@ async def create_workflow_legacy(
     raw_yaml = await request.body()
     try:
         workflow_yaml = safe_load_no_dates(raw_yaml)
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     # Auto-sanitize block labels and update references for imports
     workflow_yaml = sanitize_workflow_yaml_with_references(workflow_yaml)
@@ -626,8 +678,8 @@ async def create_workflow(
             organization=current_org,
             request=workflow_definition,
         )
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
@@ -955,8 +1007,8 @@ async def update_workflow_legacy(
     raw_yaml = await request.body()
     try:
         workflow_yaml = safe_load_no_dates(raw_yaml)
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
@@ -1039,8 +1091,8 @@ async def update_workflow(
             request=workflow_definition,
             workflow_permanent_id=workflow_id,
         )
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
@@ -1457,8 +1509,162 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_ACTION: "image/png",
     ArtifactType.SCREENSHOT_FINAL: "image/png",
     ArtifactType.RECORDING: "video/webm",
+    ArtifactType.DOWNLOAD: "application/octet-stream",
 }
 _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
+
+
+def _sanitize_header_filename(name: str) -> str:
+    """Strip characters that would break or inject into a Content-Disposition header.
+
+    The artifact URI basename is derived from a user-controlled S3 key. Rejects:
+
+    - C0 (<0x20), DEL (0x7F), C1 (0x80-0x9F) — RFC 7230 violations.
+    - ``"`` and ``\\`` — would terminate or escape the quoted value.
+    - Unicode *format* (Cf) and *separator-line/paragraph* (Zl/Zp) chars —
+      includes bidi overrides (U+202E), ZWSP (U+200B), ZWNBSP (U+FEFF);
+      these enable filename spoofing in the browser download UI.
+    """
+    cleaned = []
+    for ch in name:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
+            continue
+        if ch in ('"', "\\"):
+            continue
+        if unicodedata.category(ch) in {"Cf", "Zl", "Zp"}:
+            continue
+        cleaned.append(ch)
+    return "".join(cleaned) or "download"
+
+
+def _ascii_fallback_filename(name: str) -> str:
+    """Best-effort ASCII form of ``name`` for the ``filename=`` parameter.
+
+    NFKD-normalizes and drops combining marks first so accented Latin
+    characters survive as their base letters (``fïlè.pdf`` → ``file.pdf``)
+    instead of being stripped entirely. The RFC 5987 ``filename*=UTF-8''...``
+    form still carries the full name for modern clients.
+
+    If the ASCII stem ends up empty (e.g. pure CJK or emoji names),
+    prepend ``download`` so legacy clients don't save a bare ``.pdf``
+    hidden file.
+    """
+    normalized = unicodedata.normalize("NFKD", name)
+    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+    sanitized = _sanitize_header_filename(ascii_only)
+    stem, dot, ext = sanitized.rpartition(".")
+    if dot and not stem:
+        return f"download.{ext}"
+    return sanitized
+
+
+def _build_attachment_disposition(filename: str) -> str:
+    """Build a Content-Disposition header that survives non-ASCII filenames.
+
+    Emits both ``filename="<ascii>"`` (for legacy clients) and
+    ``filename*=UTF-8''<pct-encoded>`` (RFC 5987, for everything modern).
+    Ensures the header value is Latin-1 encodable so Starlette doesn't 500.
+    """
+    safe = _sanitize_header_filename(filename)
+    ascii_part = _ascii_fallback_filename(safe)
+    encoded = quote(safe, safe="")
+    return f"attachment; filename=\"{ascii_part}\"; filename*=UTF-8''{encoded}"
+
+
+def _artifact_filename_from_uri(uri: str | None) -> str:
+    """Extract the basename from an ``s3://``/``azure://`` URI without using
+    ``urlparse`` — that would split on ``?``/``#`` characters, which are legal
+    in S3 keys."""
+    if not uri:
+        return ""
+    return uri.rsplit("/", 1)[-1]
+
+
+def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
+    """Return (media_type, Content-Disposition) for the artifact content response.
+
+    DOWNLOAD artifacts use ``attachment`` disposition with the sanitized filename
+    so browsers never render user-supplied content inline (SKY-8862). All other
+    types keep the historical ``inline`` behaviour.
+    """
+    media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
+    if artifact.artifact_type == ArtifactType.DOWNLOAD:
+        raw_name = _artifact_filename_from_uri(artifact.uri)
+        return media_type, _build_attachment_disposition(raw_name)
+    return media_type, "inline"
+
+
+_RANGE_UNSATISFIABLE: tuple[int, int] = (-1, -1)
+
+
+def _parse_range_header(range_header: str | None, content_length: int) -> tuple[int, int] | None:
+    """Return one satisfiable byte range, ``_RANGE_UNSATISFIABLE`` when unsatisfiable, or ``None`` when ignored."""
+    if not range_header:
+        return None
+    stripped = range_header.lstrip()
+    prefix = "bytes="
+    if stripped[: len(prefix)].lower() != prefix:
+        return None
+    spec = stripped[len(prefix) :].strip()
+    # RFC 7233 allows multipart ranges (e.g. "0-100,200-300"); we don't.
+    if "," in spec or "-" not in spec:
+        return None
+    start_str, end_str = spec.split("-", 1)
+    # byte-pos = 1*DIGIT (ASCII per RFC 5234) — reject negatives, signs, and non-ASCII digits.
+    if start_str and not (start_str.isascii() and start_str.isdigit()):
+        return None
+    if end_str and not (end_str.isascii() and end_str.isdigit()):
+        return None
+    if start_str == "":
+        # Suffix range: "-N" => last N bytes.
+        if end_str == "":
+            return None
+        suffix_len = int(end_str)
+        if suffix_len <= 0:
+            return None
+        start = max(0, content_length - suffix_len)
+        end = content_length - 1
+    else:
+        start = int(start_str)
+        end = int(end_str) if end_str else content_length - 1
+        if end >= content_length:
+            end = content_length - 1
+    if start >= content_length or end < start:
+        return _RANGE_UNSATISFIABLE
+    return (start, end)
+
+
+def _artifact_content_response_headers(
+    *,
+    disposition: str,
+    is_signed: bool,
+    signed_expiry_unix: int | None = None,
+) -> dict[str, str]:
+    """Response headers for the artifact content endpoint.
+
+    For signed URLs, ``Cache-Control: max-age`` is set to the URL's remaining
+    lifetime — derived from the ``expiry`` query parameter rather than the
+    global default — so per-org TTL overrides flow through to caches. Caches
+    must not retain a body past the URL's own expiry.
+
+    Includes ``X-Content-Type-Options: nosniff`` as defence-in-depth for
+    SKY-8862: even if something upstream strips the attachment disposition,
+    the browser will not sniff the octet-stream body back into HTML/PDF.
+    """
+    if is_signed:
+        if signed_expiry_unix is not None:
+            remaining = max(0, signed_expiry_unix - int(time.time()))
+        else:
+            remaining = ARTIFACT_URL_EXPIRY_SECONDS
+        cache_control = f"private, max-age={remaining}"
+    else:
+        cache_control = "private, no-cache"
+    return {
+        "Content-Disposition": disposition,
+        "Cache-Control": cache_control,
+        "X-Content-Type-Options": "nosniff",
+    }
 
 
 @base_router.get(
@@ -1468,13 +1674,16 @@ _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
     summary="Get artifact content",
     responses={
         200: {"description": "Raw artifact content"},
+        206: {"description": "Partial artifact content (Range request)"},
         403: {"description": "Invalid or expired artifact URL"},
         404: {"description": "Artifact not found or content unavailable"},
+        416: {"description": "Range not satisfiable"},
     },
     include_in_schema=True,
 )
 async def get_artifact_content(
     artifact_id: str,
+    request: Request,
     sig: Annotated[str | None, Query(include_in_schema=False)] = None,
     expiry: Annotated[str | None, Query(include_in_schema=False)] = None,
     kid: Annotated[str | None, Query(include_in_schema=False)] = None,
@@ -1527,16 +1736,41 @@ async def get_artifact_content(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail="Artifact content not available",
         )
-    media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
+    media_type, content_disposition = _artifact_response_config(artifact)
     is_signed = sig is not None and expiry is not None and kid is not None
-    cache_control = f"private, max-age={ARTIFACT_URL_EXPIRY_SECONDS}" if is_signed else "private, no-cache"
+    signed_expiry_unix: int | None = None
+    if is_signed and expiry is not None:
+        try:
+            signed_expiry_unix = int(expiry)
+        except ValueError:
+            signed_expiry_unix = None
+    headers = _artifact_content_response_headers(
+        disposition=content_disposition,
+        is_signed=is_signed,
+        signed_expiry_unix=signed_expiry_unix,
+    )
+    headers["Accept-Ranges"] = "bytes"
+    content_length = len(content)
+    parsed_range = _parse_range_header(request.headers.get("range"), content_length)
+    if parsed_range == _RANGE_UNSATISFIABLE:
+        headers["Content-Range"] = f"bytes */{content_length}"
+        return Response(
+            status_code=http_status.HTTP_416_RANGE_NOT_SATISFIABLE,
+            headers=headers,
+        )
+    if parsed_range is not None:
+        start, end = parsed_range
+        headers["Content-Range"] = f"bytes {start}-{end}/{content_length}"
+        return Response(
+            content=content[start : end + 1],
+            media_type=media_type,
+            status_code=http_status.HTTP_206_PARTIAL_CONTENT,
+            headers=headers,
+        )
     return Response(
         content=content,
         media_type=media_type,
-        headers={
-            "Content-Disposition": "inline",
-            "Cache-Control": cache_control,
-        },
+        headers=headers,
     )
 
 
@@ -1591,6 +1825,7 @@ async def get_run_artifacts(
     },
     description="Retry sending the webhook for a run",
     summary="Retry run webhook",
+    response_model=RunWebhookReplayResponse,
 )
 @base_router.post("/runs/{run_id}/retry_webhook/", include_in_schema=False)
 async def retry_run_webhook(
@@ -1598,9 +1833,9 @@ async def retry_run_webhook(
     request: RetryRunWebhookRequest | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
-) -> None:
+) -> RunWebhookReplayResponse:
     analytics.capture("skyvern-oss-agent-run-retry-webhook")
-    await run_service.retry_run_webhook(
+    return await run_service.retry_run_webhook(
         run_id,
         organization_id=current_org.organization_id,
         api_key=x_api_key,
@@ -1695,6 +1930,7 @@ async def run_block(
     user_id: str = Depends(org_auth_service.get_current_user_id),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> BlockRunResponse:
     """
     Kick off the execution of one or more blocks in a workflow. Returns the
@@ -1714,11 +1950,15 @@ async def run_block(
             block_labels=block_run_request.block_labels,
         )
 
+        block_trigger_type = (
+            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+        )
         workflow_run = await block_service.ensure_workflow_run(
             organization=organization,
             template=template,
             workflow_permanent_id=block_run_request.workflow_id,
             block_run_request=block_run_request,
+            trigger_type=block_trigger_type,
         )
 
         browser_session_id = block_run_request.browser_session_id
@@ -1829,6 +2069,14 @@ async def heartbeat() -> Response:
     include_in_schema=False,
 )
 @legacy_base_router.get("/version/", include_in_schema=False)
+@base_router.get(
+    "/version",
+    tags=["server"],
+    summary="Get server version",
+    description="Returns the current Skyvern server version (git SHA for official builds).",
+    responses={200: {"description": "Current server version"}},
+)
+@base_router.get("/version/", include_in_schema=False)
 async def get_version() -> dict[str, str]:
     """
     Get the current server version.
@@ -2058,8 +2306,8 @@ async def retry_webhook(
     if not latest_step:
         return await app.agent.build_task_response(task=task_obj)
 
-    # retry the webhook
-    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key)
+    # retry the webhook (single-shot - manual replay is itself the retry)
+    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key, enable_retries=False)
 
     return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
@@ -2377,6 +2625,7 @@ async def run_workflow_legacy(
     )
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
+    legacy_trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -2389,6 +2638,7 @@ async def run_workflow_legacy(
             request_id=request_id,
             request=request,
             background_tasks=background_tasks,
+            trigger_type=legacy_trigger_type,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -2647,21 +2897,29 @@ async def get_workflow_and_run_from_workflow_run_id(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowRunWithWorkflowResponse:
+    analytics.capture("skyvern-oss-agent-workflow-run-get")
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
+        filter_deleted=False,
     )
 
-    if not workflow:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow run not found {workflow_run_id}",
-        )
-
-    workflow_run_status_api_response = await get_workflow_run_with_workflow_id(
-        workflow_id=workflow.workflow_permanent_id,
+    workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
+        workflow_permanent_id=workflow.workflow_permanent_id,
         workflow_run_id=workflow_run_id,
-        current_org=current_org,
+        organization_id=current_org.organization_id,
+        include_cost=True,
+        allow_deleted=True,
+    )
+    workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
+
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
+        runnable_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
+    workflow_run_status_api_response["browser_session_id"] = browser_session_id or workflow_run_status_api_response.get(
+        "browser_session_id"
     )
 
     workflow_run_status_api_response["workflow"] = workflow
@@ -2941,6 +3199,75 @@ async def get_workflow_versions(
     )
 
 
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/browser_session/reset_profile",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    tags=["Workflows"],
+    summary="Reset persisted browser profile",
+    description=(
+        "Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. "
+        "The next run will start from a fresh browser state. Use when a saved profile is corrupted."
+    ),
+    operation_id="reset_workflow_browser_profile",
+    responses={
+        204: {"description": "Successfully cleared persisted browser profile"},
+        404: {"description": "Workflow not found"},
+        500: {"description": "Storage deletion failed; retry"},
+    },
+)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/browser_session/reset_profile/",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/browser_session/refresh",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/browser_session/refresh/",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+async def reset_workflow_browser_profile(
+    workflow_permanent_id: str = Path(
+        ...,
+        description="The permanent ID of the workflow. Starts with `wpid_`.",
+        examples=["wpid_123"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    analytics.capture("skyvern-oss-agent-workflow-browser-profile-reset")
+    # Verify the workflow exists and belongs to the caller's organization.
+    await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    LOG.info(
+        "Resetting persisted browser profile for workflow",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+    try:
+        await app.STORAGE.delete_browser_session(
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+    except SkyvernHTTPException:
+        raise
+    except Exception as exc:
+        LOG.exception(
+            "Failed to reset persisted browser profile for workflow",
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        raise SkyvernHTTPException(
+            message="Failed to clear the persisted browser profile. Please retry the reset operation.",
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ) from exc
+
+
 @legacy_base_router.post(
     "/suggest/{ai_suggestion_type}",
     include_in_schema=False,
@@ -3041,10 +3368,52 @@ async def update_organization(
     org_update: OrganizationUpdate,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Organization:
-    return await app.DATABASE.organizations.update_organization(
+    # Validate the per-org artifact URL expiry against the same bounds the
+    # signing helper clamps to. Reject out-of-range values at the API edge so
+    # users see a clear 400 instead of a silently clamped value persisting in
+    # the DB. The clear flag and a non-null override are mutually exclusive —
+    # the repo prefers the clear flag, but reject the ambiguity here too.
+    if org_update.artifact_url_expiry_seconds is not None and not org_update.clear_artifact_url_expiry_seconds:
+        if (
+            org_update.artifact_url_expiry_seconds < ARTIFACT_URL_EXPIRY_SECONDS_MIN
+            or org_update.artifact_url_expiry_seconds > ARTIFACT_URL_EXPIRY_SECONDS_MAX
+        ):
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"artifact_url_expiry_seconds must be between "
+                    f"{ARTIFACT_URL_EXPIRY_SECONDS_MIN} and {ARTIFACT_URL_EXPIRY_SECONDS_MAX} seconds"
+                ),
+            )
+    if org_update.clear_artifact_url_expiry_seconds and org_update.artifact_url_expiry_seconds is not None:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "clear_artifact_url_expiry_seconds cannot be combined with a non-null "
+                "artifact_url_expiry_seconds — pick one"
+            ),
+        )
+    if org_update.clear_max_steps_per_workflow_run and org_update.max_steps_per_workflow_run is not None:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "clear_max_steps_per_workflow_run cannot be combined with a non-null "
+                "max_steps_per_workflow_run — pick one"
+            ),
+        )
+    updated = await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
+        max_steps_per_workflow_run=org_update.max_steps_per_workflow_run,
+        clear_max_steps_per_workflow_run=org_update.clear_max_steps_per_workflow_run,
+        max_retries_per_step=org_update.max_retries_per_step,
+        webhook_callback_url=org_update.webhook_callback_url,
+        artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
+        clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
     )
+
+    org_auth_service.invalidate_cached_org(current_org.organization_id)
+    return updated
 
 
 @legacy_base_router.get(
@@ -3062,6 +3431,23 @@ async def get_organizations(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> GetOrganizationsResponse:
     return GetOrganizationsResponse(organizations=[current_org])
+
+
+@legacy_base_router.get(
+    "/organizations/me",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_current_organization",
+    },
+)
+@legacy_base_router.get(
+    "/organizations/me/",
+    include_in_schema=False,
+)
+async def get_current_organization(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Organization:
+    return current_org
 
 
 @legacy_base_router.get(
@@ -3133,6 +3519,7 @@ async def run_task_v2(
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     if x_max_iterations_override or x_max_steps_override:
         LOG.info(
@@ -3143,6 +3530,9 @@ async def run_task_v2(
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
+    legacy_v2_trigger_type = (
+        WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
+    )
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
             organization=organization,
@@ -3160,6 +3550,7 @@ async def run_task_v2(
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
             browser_address=data.browser_address,
+            trigger_type=legacy_v2_trigger_type,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

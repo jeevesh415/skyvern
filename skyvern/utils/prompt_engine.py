@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.errors.errors import UserDefinedError
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.scraper.scraped_page import ElementTreeBuilder
@@ -61,6 +62,16 @@ def load_prompt_with_elements_tracked(
     prompt_engine: PromptEngine,
     template_name: str,
     html_need_skyvern_attrs: bool = True,
+    *,
+    # SKY-9718 Layer 1 — deterministic lean-tree transforms. Each flag toggles
+    # one transform independently. Callers decide which to enable (typically by
+    # AND-ing with `skyvern_context.current().enable_lean_element_tree` if they
+    # want the experiment gate). To drop Skyvern internal IDs from the rendered
+    # HTML, callers pass `html_need_skyvern_attrs=False` — that's the existing
+    # `json_to_html` mechanism and stacks on top of any lean flags chosen here.
+    lean_compress_long_href: bool = False,
+    lean_compress_image_src: bool = False,
+    lean_strip_url_query_strings: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, Any]]:
     """Same as load_prompt_with_elements but also returns post-ceiling kwargs.
@@ -70,7 +81,18 @@ def load_prompt_with_elements_tracked(
     inputs for caching should use these values instead of the pre-drop kwargs
     so two requests that render to the same final prompt share a cache key.
     """
-    elements = element_tree_builder.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
+    lean_any = lean_compress_long_href or lean_compress_image_src or lean_strip_url_query_strings
+    if lean_any and element_tree_builder.support_lean_elements_tree():
+        elements = element_tree_builder.build_lean_elements_tree(
+            html_need_skyvern_attrs=html_need_skyvern_attrs,
+            compress_long_href=lean_compress_long_href,
+            compress_image_src=lean_compress_image_src,
+            strip_url_query_strings=lean_strip_url_query_strings,
+        )
+    else:
+        # Builder doesn't implement lean (e.g. IncrementalScrapePage) or caller
+        # asked for no transforms — fall back to the plain element tree.
+        elements = element_tree_builder.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
     prompt = prompt_engine.load_prompt(
         template_name,
         elements=elements,
@@ -79,6 +101,8 @@ def load_prompt_with_elements_tracked(
     token_count = count_tokens(prompt)
     if token_count > DEFAULT_MAX_TOKENS and element_tree_builder.support_economy_elements_tree():
         # get rid of all the secondary elements like SVG, etc
+        # NOTE: economy fallback drops the lean recipe — context-overflow firefighting
+        # path; we accept the lean savings loss in exchange for fitting under the cap.
         elements = element_tree_builder.build_economy_elements_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
         prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
         economy_token_count = count_tokens(prompt)
@@ -107,7 +131,7 @@ def load_prompt_with_elements_tracked(
                 max_tokens=DEFAULT_MAX_TOKENS,
             )
 
-    return enforce_prompt_ceiling_tracked(
+    final_prompt, final_kwargs = enforce_prompt_ceiling_tracked(
         prompt,
         prompt_engine=prompt_engine,
         template_name=template_name,
@@ -115,12 +139,33 @@ def load_prompt_with_elements_tracked(
         elements=elements,
     )
 
+    # SKY-9718: stash per-prompt token breakdown on SkyvernContext so the
+    # downstream LLM API handler log can attach html_token_count / html_pct
+    # alongside input_tokens / llm_cost.
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        html_tokens = count_tokens(elements) if elements else 0
+        total_tokens_local = count_tokens(final_prompt)
+        html_pct = (html_tokens / total_tokens_local) if total_tokens_local else None
+        ctx.last_prompt_breakdown = {
+            "html_token_count": html_tokens,
+            "total_tokens_local": total_tokens_local,
+            "html_pct": round(html_pct, 4) if html_pct is not None else None,
+            "template_name": template_name,
+        }
+
+    return final_prompt, final_kwargs
+
 
 def load_prompt_with_elements(
     element_tree_builder: ElementTreeBuilder,
     prompt_engine: PromptEngine,
     template_name: str,
     html_need_skyvern_attrs: bool = True,
+    *,
+    lean_compress_long_href: bool = False,
+    lean_compress_image_src: bool = False,
+    lean_strip_url_query_strings: bool = False,
     **kwargs: Any,
 ) -> str:
     prompt, _ = load_prompt_with_elements_tracked(
@@ -128,6 +173,9 @@ def load_prompt_with_elements(
         prompt_engine=prompt_engine,
         template_name=template_name,
         html_need_skyvern_attrs=html_need_skyvern_attrs,
+        lean_compress_long_href=lean_compress_long_href,
+        lean_compress_image_src=lean_compress_image_src,
+        lean_strip_url_query_strings=lean_strip_url_query_strings,
         **kwargs,
     )
     return prompt

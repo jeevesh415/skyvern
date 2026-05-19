@@ -179,14 +179,44 @@ def test_lookup_age_seconds_is_monotonic_delta(monkeypatch: pytest.MonkeyPatch) 
     assert result.age_seconds == pytest.approx(12.5)
 
 
-def test_key_changes_when_local_date_changes() -> None:
-    """Date-relative extraction goals must miss when the date changes (midnight boundary)."""
-    assert _key(local_datetime="2026-04-10T00:00:00") != _key(local_datetime="2026-04-11T00:00:00")
+def test_invalidate_key_drops_single_entry() -> None:
+    """Per-key eviction leaves sibling entries intact. Used by the retry self-heal path."""
+    key_a = _key()
+    key_b = _key(current_url="https://example.com/other")
+    extraction_cache.store("wfr_1", key_a, {"v": "a"})
+    extraction_cache.store("wfr_1", key_b, {"v": "b"})
+
+    removed = extraction_cache.invalidate_key("wfr_1", key_a)
+    assert removed is True
+    assert extraction_cache.lookup("wfr_1", key_a).hit is False
+    # Sibling entry must survive — invalidate is per-key, not per-run.
+    hit_b = extraction_cache.lookup("wfr_1", key_b)
+    assert hit_b.hit is True
+    assert hit_b.value == {"v": "b"}
 
 
-def test_key_stable_across_same_date_different_times() -> None:
-    """Same date with different timestamps should produce the same key (truncated to date)."""
-    assert _key(local_datetime="2026-04-10T08:30:00.123456") == _key(local_datetime="2026-04-10T23:59:59.999999")
+def test_invalidate_key_returns_false_for_unknown_key() -> None:
+    extraction_cache.store("wfr_1", _key(), {"v": "a"})
+    assert extraction_cache.invalidate_key("wfr_1", "nonexistent-key") is False
+
+
+def test_invalidate_key_returns_false_for_unknown_workflow_run() -> None:
+    assert extraction_cache.invalidate_key("wfr_missing", _key()) is False
+
+
+def test_invalidate_key_returns_false_for_empty_workflow_run_id() -> None:
+    """Falsy workflow_run_id is a no-op, matching the store/lookup contract."""
+    assert extraction_cache.invalidate_key(None, _key()) is False
+    assert extraction_cache.invalidate_key("", _key()) is False
+
+
+def test_compute_cache_key_rejects_legacy_local_datetime_kwarg() -> None:
+    """``local_datetime`` was dropped from the signature (SKY-8873): content
+    hash alone defines cache identity, so callers that still try to pass it
+    must fail loudly rather than silently producing a key that happens to be
+    stable-for-the-wrong-reason."""
+    with pytest.raises(TypeError):
+        extraction_cache.compute_cache_key(call_path="test", local_datetime="2026-04-10T00:00:00")  # type: ignore[call-arg]
 
 
 def test_none_and_empty_string_produce_different_keys() -> None:
@@ -423,6 +453,143 @@ class TestCanonicalElementTree:
         h1 = '<div ID="3f8a9b12-1234-4678-9abc-def012345678">x</div>'
         h2 = '<div ID="fedcba98-8765-4321-abcd-123456789abc">x</div>'
         assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_preserves_content_inside_frame_tags(self) -> None:
+        """Regression for SKY-9524: legacy framed apps place form controls
+        inside <frame> tags. HTML5-strict parsers treat <frame> as void and
+        drop child content on serialize, collapsing distinct per-record pages
+        into the same canonical output. Two pages whose only difference is
+        per-record form input values must produce different canonical output.
+        """
+        h1 = (
+            '<frameset><frame name="criteria" src="criteria.aspx">'
+            '<input name="txtLastName" value="Lastname1">'
+            '<input name="txtFirstName" value="Firstname1">'
+            "</frame></frameset>"
+        )
+        h2 = (
+            '<frameset><frame name="criteria" src="criteria.aspx">'
+            '<input name="txtLastName" value="Lastname2">'
+            '<input name="txtFirstName" value="Firstname2">'
+            "</frame></frameset>"
+        )
+        c1 = extraction_cache._canonical_element_tree(h1)
+        c2 = extraction_cache._canonical_element_tree(h2)
+        assert c1 != c2
+        assert c1 is not None and "Lastname1" in c1
+        assert c2 is not None and "Lastname2" in c2
+
+    def test_preserves_input_value_attributes(self) -> None:
+        """`value=` attributes on form inputs carry per-record data (member IDs,
+        patient names) and must always survive canonicalization unchanged.
+        """
+        h1 = '<input name="memberId" value="200002578">'
+        h2 = '<input name="memberId" value="200451314">'
+        c1 = extraction_cache._canonical_element_tree(h1)
+        c2 = extraction_cache._canonical_element_tree(h2)
+        assert c1 != c2
+        assert c1 is not None and "200002578" in c1
+        assert c2 is not None and "200451314" in c2
+
+    def test_preserves_selected_attribute_on_select(self) -> None:
+        """<select selected="..."> indicates the active option (e.g. DOB year)
+        and must differentiate two records.
+        """
+        h1 = '<select name="ddlDOBYear" selected="1968"><option>1968</option></select>'
+        h2 = '<select name="ddlDOBYear" selected="1957"><option>1957</option></select>'
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_does_not_corrupt_text_with_angle_brackets(self) -> None:
+        """Stray `<` and `>` in text content (e.g. inequality math) must not
+        be tokenized as tag fragments by the walker."""
+        h = "<p>If x < 5 and y > 0 then z = x + y</p>"
+        out = extraction_cache._canonical_element_tree(h)
+        assert out is not None
+        assert "If x < 5 and y > 0 then z = x + y" in out
+
+    def test_scrubs_csrf_with_unquoted_value(self) -> None:
+        """Unquoted CSRF token values must still be scrubbed to empty so the
+        token doesn't leak into the cache key."""
+        h1 = '<input name="_csrf" value=abc123def>'
+        h2 = '<input name="_csrf" value=xyz789ghi>'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_preserves_non_redacted_aria_attributes(self) -> None:
+        """`aria-controls` / `aria-owns` are NOT in the suspect set — they
+        identify component anchors and must differentiate pages.
+        """
+        h1 = '<button aria-controls="panel-3f8a9b12c4">Toggle</button>'
+        h2 = '<button aria-controls="panel-fedcba9876">Toggle</button>'
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_does_not_redact_id_inside_attribute_value(self) -> None:
+        """Substring `id='...'` inside another attribute's quoted value must
+        NOT be redacted — only attribute-position `id=` is in scope."""
+        h1 = "<div onclick=\"fn(id='abc123def')\">click</div>"
+        h2 = "<div onclick=\"fn(id='xyz789ghi')\">click</div>"
+        assert extraction_cache._canonical_element_tree(h1) != extraction_cache._canonical_element_tree(h2)
+
+    def test_url_with_id_query_param_in_src_does_not_collide(self) -> None:
+        """`<frame src="page?id=A">` and `<frame src="page?id=B">` must produce
+        DIFFERENT canonical output — the id query string is a real
+        differentiator and must survive."""
+        h1 = '<frame src="page.aspx?id=A&action=show">'
+        h2 = '<frame src="page.aspx?id=B&action=show">'
+        c1 = extraction_cache._canonical_element_tree(h1)
+        c2 = extraction_cache._canonical_element_tree(h2)
+        assert c1 != c2
+        assert c1 is not None and "id=A" in c1
+        assert c2 is not None and "id=B" in c2
+
+    def test_preserves_textarea_text_with_angle_brackets(self) -> None:
+        """`<textarea>` body is raw-text per HTML spec — its content must pass
+        through verbatim, including literal `<` and `>` from user input,
+        without being tokenized as tags by the canonicalizer.
+        """
+        h = "<textarea>if x < 5 and y > 0 then z = x + y</textarea>"
+        out = extraction_cache._canonical_element_tree(h)
+        assert out is not None
+        assert "if x < 5 and y > 0 then z = x + y" in out
+
+    def test_handles_attribute_value_containing_angle_bracket(self) -> None:
+        """A `>` inside a quoted attribute value must NOT close the tag —
+        the walker is quote-aware so the tag boundary is the outer `>`.
+        Suspect-attribute redaction still runs on subsequent attributes.
+        """
+        h1 = '<input value="a>b" id="x-3f8a9b12c4">'
+        h2 = '<input value="a>b" id="x-fedcba9876">'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_scrubs_csrf_with_apostrophe_in_double_quoted_value(self) -> None:
+        """Double-quoted attribute values are allowed to contain `'` per HTML
+        spec. The CSRF scrubber must still match and zero the value — two
+        tokens that differ only by the apostrophe-bearing payload must hash
+        identically after scrubbing.
+        """
+        h1 = '<input name="_csrf" value="abc\'123">'
+        h2 = '<input name="_csrf" value="xyz\'789">'
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_scrubs_csrf_with_double_quote_in_single_quoted_value(self) -> None:
+        """Single-quoted attribute values are allowed to contain `"` per HTML
+        spec. Symmetric case to the apostrophe test.
+        """
+        h1 = "<input name='_csrf' value='abc\"123'>"
+        h2 = "<input name='_csrf' value='xyz\"789'>"
+        assert extraction_cache._canonical_element_tree(h1) == extraction_cache._canonical_element_tree(h2)
+
+    def test_handles_unescaped_double_quote_in_attribute_value(self) -> None:
+        """Pinned behavior under malformed scraper input (a known scraper bug:
+        `build_attribute` does not escape `"`). Must not crash, and two
+        distinct malformed inputs must NOT collapse to the same canonical
+        (graceful miss-churn is acceptable; cross-record collision is not).
+        """
+        h1 = '<input value="a"b" id="x-3f8a9b12c4">'
+        h2 = '<input value="c"d" id="x-fedcba9876">'
+        c1 = extraction_cache._canonical_element_tree(h1)
+        c2 = extraction_cache._canonical_element_tree(h2)
+        assert c1 is not None and c2 is not None
+        assert c1 != c2
 
 
 # ---------------------------------------------------------------------------

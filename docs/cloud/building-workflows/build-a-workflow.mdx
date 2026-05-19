@@ -14,7 +14,15 @@ keywords:
   - visual builder
 ---
 
-A task handles one goal on one page. When your automation needs multiple steps, you need a workflow. This page explains how workflows work, walks you through building one from scratch, and covers the editor's features.
+Workflows are multi-step automations built visually in the Cloud UI. You drag blocks onto a canvas, wire them together, configure each one, and run the whole sequence with a click. No code required. Workflows can be versioned, shared across your team, scheduled on a cron, and run with different parameters each time.
+
+If you prefer writing automation code in Python or TypeScript, see [Browser Automation](/developers/browser-automations/overview) in the developer docs. Both approaches handle multi-step work across pages. Workflows are the visual path, browser automations are the code path.
+
+<Info>
+**Workflows vs. Browser Automation:** Workflows are defined in this visual editor and run from the Cloud UI (or [triggered from code](/cloud/building-workflows/run-from-code)). Browser automations are written in Python/TypeScript using Page, Agent, and Browser. Choose based on whether your team prefers a visual editor or a code editor.
+</Info>
+
+This page explains how workflows work, walks you through building one from scratch, and covers the editor's features.
 
 ## How workflows work
 
@@ -39,7 +47,7 @@ For example, an Extraction block labeled `scrape_listings` produces output that 
 |----------|-------------|----------|
 | **Browser Automation** | Interact with web pages using AI | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
 | **Data and Extraction** | Transform data without a browser | Text Prompt, File Parser |
-| **Control Flow** | Branch, loop, validate, or pause | Loop, Conditional, AI Validation, Code, Wait |
+| **Control Flow** | Branch, loop, validate, or pause | Loop, While Loop, Conditional, AI Validation, Code, Wait |
 | **Files** | Download and upload files | File Download, Cloud Storage Upload |
 | **Communication** | Send data to external services or humans | Send Email, HTTP Request, Human Interaction |
 
@@ -256,7 +264,7 @@ Blocks auto-connect when you insert them via the **+** button. They execute top 
 
 **Conditional blocks** create branches. Each branch connects to a different sequence of blocks and merges back at a common point.
 
-**Loop blocks** contain child blocks that repeat for each item in the loop's list.
+**Loop blocks** contain child blocks that repeat for each item in the loop's list. **While Loop blocks** contain child blocks that repeat while their condition remains true.
 
 To reorder blocks, delete the block you want to move and re-add it at the desired position using the **+** button.
 

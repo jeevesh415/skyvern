@@ -54,8 +54,10 @@ import {
   WorkflowApiResponse,
   WorkflowBlock,
   WorkflowParameter,
+  isNestedLoopWorkflowBlock,
 } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
+import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
 
@@ -76,8 +78,7 @@ function getLoginBlocksWithoutCredentials(
       }
     }
 
-    // Check nested blocks in for_loop
-    if (block.block_type === "for_loop" && block.loop_blocks) {
+    if (isNestedLoopWorkflowBlock(block) && block.loop_blocks) {
       result.push(...getLoginBlocksWithoutCredentials(block.loop_blocks));
     }
   }
@@ -118,6 +119,7 @@ type Props = {
     cdpAddress: string | null;
     maxScreenshotScrolls: number | null;
     extraHttpHeaders: Record<string, string> | null;
+    browserProfileId: string | null;
     runWith: string | null;
   };
 };
@@ -186,6 +188,7 @@ type RunWorkflowRequestBody = {
   proxy_location: ProxyLocation | null;
   webhook_callback_url?: string | null;
   browser_session_id: string | null;
+  browser_profile_id?: string | null;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   browser_address?: string | null;
@@ -201,6 +204,7 @@ function getRunWorkflowRequestBody(
     webhookCallbackUrl,
     proxyLocation,
     browserSessionId,
+    browserProfileId,
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
@@ -215,11 +219,13 @@ function getRunWorkflowRequestBody(
   );
 
   const bsi = browserSessionId?.trim() === "" ? null : browserSessionId;
+  const bpi = browserProfileId?.trim() === "" ? null : browserProfileId;
 
   const body: RunWorkflowRequestBody = {
     data: parsedParameters,
     proxy_location: proxyLocation,
     browser_session_id: bsi,
+    browser_profile_id: bpi,
     browser_address: cdpAddress,
     run_with: runWith,
     ai_fallback: aiFallback ?? true,
@@ -281,6 +287,7 @@ type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   browserSessionId: string | null;
+  browserProfileId: string | null;
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
@@ -307,6 +314,14 @@ function RunWorkflowForm({
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
 
+  const blockingParameterTypes = new Set([
+    "boolean",
+    "integer",
+    "float",
+    "file_url",
+    "json",
+  ]);
+
   const form = useForm<RunWorkflowFormType>({
     mode: "onTouched",
     reValidateMode: "onChange",
@@ -315,6 +330,7 @@ function RunWorkflowForm({
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
+      browserProfileId: initialSettings.browserProfileId ?? null,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -324,6 +340,13 @@ function RunWorkflowForm({
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
+
+  const formErrors = form.formState.errors;
+  const hasBlockingParameterError = workflowParameters.some(
+    (param) =>
+      blockingParameterTypes.has(param.workflow_parameter_type) &&
+      formErrors[param.key],
+  );
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
@@ -416,6 +439,7 @@ function RunWorkflowForm({
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
+      browserProfileId: initialSettings.browserProfileId ?? null,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -450,6 +474,7 @@ function RunWorkflowForm({
       webhookCallbackUrl,
       proxyLocation,
       browserSessionId,
+      browserProfileId,
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
@@ -467,6 +492,7 @@ function RunWorkflowForm({
       webhookCallbackUrl,
       proxyLocation,
       browserSessionId,
+      browserProfileId,
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
@@ -480,6 +506,7 @@ function RunWorkflowForm({
       "webhookCallbackUrl",
       "proxyLocation",
       "browserSessionId",
+      "browserProfileId",
       "maxScreenshotScrolls",
       "extraHttpHeaders",
       "cdpAddress",
@@ -497,11 +524,7 @@ function RunWorkflowForm({
   const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
     const hasBlockingErrors = workflowParameters.some(
       (param) =>
-        (param.workflow_parameter_type === "boolean" ||
-          param.workflow_parameter_type === "integer" ||
-          param.workflow_parameter_type === "float" ||
-          param.workflow_parameter_type === "file_url" ||
-          param.workflow_parameter_type === "json") &&
+        blockingParameterTypes.has(param.workflow_parameter_type) &&
         errors[param.key],
     );
 
@@ -560,7 +583,9 @@ function RunWorkflowForm({
             <Button
               type="submit"
               disabled={
-                runWorkflowMutation.isPending || hasLoginBlockValidationError
+                runWorkflowMutation.isPending ||
+                hasLoginBlockValidationError ||
+                hasBlockingParameterError
               }
             >
               {runWorkflowMutation.isPending && (
@@ -991,6 +1016,38 @@ function RunWorkflowForm({
                                       ? ""
                                       : (field.value as string)
                                   }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="browserProfileId"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Browser Profile
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  Load a saved browser profile to reuse cookies,
+                                  storage, and signed-in state for this run.
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <BrowserProfileSelector
+                                  value={field.value}
+                                  onChange={field.onChange}
                                 />
                               </FormControl>
                               <FormMessage />

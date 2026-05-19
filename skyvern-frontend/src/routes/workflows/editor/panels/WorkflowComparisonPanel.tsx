@@ -15,6 +15,7 @@ import { FlowRenderer } from "../FlowRenderer";
 import { getElements } from "../workflowEditorUtils";
 import { ProxyLocation } from "@/api/types";
 import { AppNode } from "../nodes";
+import { areBlocksIdentical } from "../../util/compareBlocks";
 
 type BlockComparison = {
   leftBlock?: WorkflowBlock;
@@ -50,6 +51,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   send_email: "sendEmail",
   text_prompt: "textPrompt",
   for_loop: "loop",
+  while_loop: "loop",
   file_url_parser: "fileParser",
   pdf_parser: "pdfParser",
   download_to_s3: "download",
@@ -57,6 +59,8 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   file_upload: "fileUpload",
   goto_url: "url",
   http_request: "http_request",
+  google_sheets_read: "googleSheetsRead",
+  google_sheets_write: "googleSheetsWrite",
 };
 
 function getBlockIdentifier(block: WorkflowBlock): string {
@@ -64,23 +68,6 @@ function getBlockIdentifier(block: WorkflowBlock): string {
   const nodeType =
     BLOCK_TYPE_TO_NODE_TYPE[block.block_type] || block.block_type;
   return `${nodeType}:${block.label}`;
-}
-
-function areBlocksIdentical(
-  block1: WorkflowBlock,
-  block2: WorkflowBlock,
-): boolean {
-  // Convert blocks to string representation for comparison
-  // Remove dynamic fields that shouldn't affect equality
-  const normalize = (block: WorkflowBlock) => {
-    const normalized = { ...block };
-    // Remove output_parameter as it might have different IDs
-    const { output_parameter, ...rest } = normalized;
-    console.log(output_parameter);
-    return JSON.stringify(rest, Object.keys(rest).sort());
-  };
-
-  return normalize(block1) === normalize(block2);
 }
 
 function compareWorkflowBlocks(
@@ -151,6 +138,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
+    browserProfileId: version.browser_profile_id ?? null,
     model: version.model,
     maxScreenshotScrolls: version.max_screenshot_scrolls || 3,
     extraHttpHeaders: version.extra_http_headers
@@ -163,6 +151,8 @@ function getWorkflowElements(version: WorkflowVersion) {
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
+    workflowSystemPrompt:
+      version.workflow_definition?.workflow_system_prompt ?? null,
   };
 
   // Deep clone the blocks to ensure complete isolation from main editor

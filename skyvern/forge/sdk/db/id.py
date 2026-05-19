@@ -44,6 +44,7 @@ CREDENTIAL_PREFIX = "cred"
 DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
+GOOGLE_OAUTH_CREDENTIAL_PREFIX = "goac"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -51,6 +52,7 @@ ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
 OUTPUT_PARAMETER_PREFIX = "op"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
+PROXY_USAGE_PREFIX = "pxu"
 SCRIPT_FILE_PREFIX = "sf"
 SCRIPT_REVISION_PREFIX = "sr"
 SCRIPT_PREFIX = "s"
@@ -210,6 +212,11 @@ def generate_persistent_browser_session_id() -> str:
     return f"{PERSISTENT_BROWSER_SESSION_ID}_{int_id}"
 
 
+def generate_proxy_usage_id() -> str:
+    int_id = generate_id()
+    return f"{PROXY_USAGE_PREFIX}_{int_id}"
+
+
 def generate_browser_profile_id() -> str:
     int_id = generate_id()
     return f"{BROWSER_PROFILE_PREFIX}_{int_id}"
@@ -238,6 +245,11 @@ def generate_debug_session_id() -> str:
 def generate_folder_id() -> str:
     int_id = generate_id()
     return f"{FOLDER_PREFIX}_{int_id}"
+
+
+def generate_google_oauth_credential_id() -> str:
+    int_id = generate_id()
+    return f"{GOOGLE_OAUTH_CREDENTIAL_PREFIX}_{int_id}"
 
 
 def generate_organization_bitwarden_collection_id() -> str:
@@ -350,4 +362,4 @@ def _get_worker_hash() -> int:
 
 def _generate_worker_hash() -> int:
     worker_identity = f"{platform.node()}:{os.getpid()}"
-    return int(hashlib.md5(worker_identity.encode()).hexdigest()[-15:], 16)
+    return int(hashlib.md5(worker_identity.encode(), usedforsecurity=False).hexdigest()[-15:], 16)

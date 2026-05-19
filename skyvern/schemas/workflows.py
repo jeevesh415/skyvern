@@ -321,6 +321,16 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
                 workflow_definition["parameters"], old_output_key, new_output_key
             )
 
+        # workflow_system_prompt is rendered through Jinja at execution time, so
+        # references inside it need the same rename treatment as block fields.
+        if isinstance(workflow_definition.get("workflow_system_prompt"), str):
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_output_key, new_output_key
+            )
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_label, new_label
+            )
+
     # Step 4: Update all parameter key references
     for old_key, new_key in param_key_mapping.items():
         # Update Jinja references in blocks (e.g., {{ old_key }})
@@ -337,6 +347,11 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
             # Also update direct string references (e.g., source_parameter_key)
             workflow_definition["parameters"] = _replace_direct_string_in_value(
                 workflow_definition["parameters"], old_key, new_key
+            )
+
+        if isinstance(workflow_definition.get("workflow_system_prompt"), str):
+            workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
+                workflow_definition["workflow_system_prompt"], old_key, new_key
             )
 
     # Rewrite workflow-level error_code_mapping atomically so substitutions don't chain
@@ -397,6 +412,7 @@ class BlockType(StrEnum):
     TASK = "task"
     TaskV2 = "task_v2"
     FOR_LOOP = "for_loop"
+    WHILE_LOOP = "while_loop"
     CONDITIONAL = "conditional"
     CODE = "code"
     TEXT_PROMPT = "text_prompt"
@@ -418,6 +434,8 @@ class BlockType(StrEnum):
     HUMAN_INTERACTION = "human_interaction"
     PRINT_PAGE = "print_page"
     WORKFLOW_TRIGGER = "workflow_trigger"
+    GOOGLE_SHEETS_READ = "google_sheets_read"
+    GOOGLE_SHEETS_WRITE = "google_sheets_write"
 
 
 class BlockStatus(StrEnum):
@@ -439,9 +457,14 @@ class BlockResult:
     failure_reason: str | None = None
     error_codes: list[str] = field(default_factory=list)
     workflow_run_block_id: str | None = None
+    # True for synthetic loop-level failures (max iterations, max steps per iter,
+    # missing block label) so callers can distinguish them from real child-block
+    # results. Set explicitly at the synthetic construction sites in loop helpers.
+    is_synthetic_loop_failure: bool = False
 
 
 class FileType(StrEnum):
+    AUTO_DETECT = "auto_detect"
     CSV = "csv"
     EXCEL = "excel"
     PDF = "pdf"
@@ -611,6 +634,10 @@ class BlockYAML(BaseModel, abc.ABC):
     )
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
+    # Opt-out from workflow-level workflow_system_prompt inheritance (and, on a
+    # WorkflowTriggerBlock, from propagating the parent chain's prompt into the
+    # spawned child run). A no-op for deterministic blocks that don't call an LLM.
+    ignore_workflow_system_prompt: bool = False
     # Only valid for blocks inside a for loop block
     # Whether to continue to the next iteration when the block fails
     next_loop_on_failure: bool = False
@@ -684,6 +711,13 @@ class BranchCriteriaYAML(BaseModel):
     criteria_type: Literal["jinja2_template", "prompt"] = "jinja2_template"
     expression: str
     description: str | None = None
+
+
+class WhileLoopBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WHILE_LOOP] = BlockType.WHILE_LOOP  # type: ignore
+
+    loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
+    condition: BranchCriteriaYAML
 
 
 class BranchConditionYAML(BaseModel):
@@ -831,7 +865,7 @@ class FileParserBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER  # type: ignore
 
     file_url: str
-    file_type: FileType
+    file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
 
 
@@ -1028,6 +1062,29 @@ class WorkflowTriggerBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class GoogleSheetsReadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.GOOGLE_SHEETS_READ] = BlockType.GOOGLE_SHEETS_READ  # type: ignore
+    spreadsheet_url: str
+    sheet_name: str | None = None
+    range: str | None = None
+    credential_id: str | None = None
+    has_header_row: bool = True
+    parameter_keys: list[str] | None = None
+
+
+class GoogleSheetsWriteBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.GOOGLE_SHEETS_WRITE] = BlockType.GOOGLE_SHEETS_WRITE  # type: ignore
+    spreadsheet_url: str
+    sheet_name: str | None = None
+    range: str | None = None
+    credential_id: str | None = None
+    write_mode: Literal["append", "update"] = "append"
+    values: str = ""
+    column_mapping: dict[str, str] | None = None
+    create_sheet_if_missing: bool = False
+    parameter_keys: list[str] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -1045,6 +1102,7 @@ PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator=
 BLOCK_YAML_SUBCLASSES = (
     TaskBlockYAML
     | ForLoopBlockYAML
+    | WhileLoopBlockYAML
     | CodeBlockYAML
     | TextPromptBlockYAML
     | DownloadToS3BlockYAML
@@ -1067,6 +1125,8 @@ BLOCK_YAML_SUBCLASSES = (
     | ConditionalBlockYAML
     | PrintPageBlockYAML
     | WorkflowTriggerBlockYAML
+    | GoogleSheetsReadBlockYAML
+    | GoogleSheetsWriteBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
@@ -1077,6 +1137,7 @@ class WorkflowDefinitionYAML(BaseModel):
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    workflow_system_prompt: str | None = None
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":
@@ -1107,6 +1168,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    browser_profile_id: str | None = None
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False

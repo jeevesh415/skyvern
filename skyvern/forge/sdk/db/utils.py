@@ -1,6 +1,8 @@
 import json
 import typing
+from typing import Any
 
+import pydantic
 import pydantic.json
 import structlog
 
@@ -46,6 +48,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
+from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -96,6 +99,10 @@ from skyvern.webeye.actions.actions import (
 LOG = structlog.get_logger()
 
 
+def nullable_column_equals(column: Any, value: Any) -> Any:
+    return column.is_(None) if value is None else column == value
+
+
 def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
     if not raw:
         return None
@@ -106,7 +113,11 @@ def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
         return None
 
 
-def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
+def deserialize_proxy_location(
+    value: str | None,
+    *,
+    raise_on_invalid_geo_target: bool = False,
+) -> ProxyLocationInput:
     """
     Deserialize proxy_location from database storage.
 
@@ -118,12 +129,16 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
     if value is None:
         return None
 
+    value = value.strip()
     result: ProxyLocationInput = None
 
     # Try to parse as JSON first (for GeoTarget)
     if value.startswith("{"):
         try:
             data = json.loads(value)
+            if not isinstance(data, dict):
+                raise ValueError("GeoTarget proxy_location JSON must be an object")
+
             # Handle malformed subdivision (e.g., boolean instead of string)
             subdivision = data.get("subdivision")
             if subdivision is not None and not isinstance(subdivision, str):
@@ -137,6 +152,8 @@ def _deserialize_proxy_location(value: str | None) -> ProxyLocationInput:
             )
             return result
         except (json.JSONDecodeError, ValueError) as e:
+            if raise_on_invalid_geo_target:
+                raise
             LOG.warning("Failed to parse proxy_location as GeoTarget", db_value=value, error=str(e))
 
     # Try as ProxyLocation enum
@@ -163,9 +180,10 @@ def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
         result = json.dumps(proxy_location.model_dump())
     elif isinstance(proxy_location, dict):
         result = json.dumps(proxy_location)
+    elif isinstance(proxy_location, ProxyLocation):
+        result = proxy_location.value
     else:
-        # ProxyLocation enum - return the string value
-        result = str(proxy_location)
+        raise TypeError(f"Unsupported proxy_location type: {type(proxy_location).__name__}")
 
     LOG.debug(
         "Serializing proxy_location for DB",
@@ -211,6 +229,43 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 
+def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
+    """Fail-open size guard for jsonb-column writes (SKY-9779)."""
+    # Fast-path: None and scalars can't approach the cap; skip the full re-serialization
+    # that 99.9% of writes would pay for nothing.
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str) and len(value) <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
+        return value
+
+    try:
+        serialized = _custom_json_serializer(value)
+    except Exception:
+        LOG.warning(
+            "Failed to measure jsonb value size; passing through unchanged",
+            exc_info=True,
+            context=context or {},
+        )
+        return value
+
+    size_bytes = len(serialized.encode("utf-8"))
+    if size_bytes <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
+        return value
+
+    LOG.warning(
+        "Truncating oversized jsonb value",
+        original_size_bytes=size_bytes,
+        limit_bytes=OUTPUT_PARAMETER_MAX_VALUE_BYTES,
+        **(context or {}),
+    )
+    return {
+        "truncated": True,
+        "reason": "exceeded_max_jsonb_value_size",
+        "original_size_bytes": size_bytes,
+        "limit_bytes": OUTPUT_PARAMETER_MAX_VALUE_BYTES,
+    }
+
+
 def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_permanent_id: str | None = None) -> Task:
     if debug_enabled:
         LOG.debug("Converting TaskModel to Task", task_id=task_obj.task_id)
@@ -236,7 +291,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         extracted_information=task_obj.extracted_information,
         failure_reason=task_obj.failure_reason,
         organization_id=task_obj.organization_id,
-        proxy_location=_deserialize_proxy_location(task_obj.proxy_location),
+        proxy_location=deserialize_proxy_location(task_obj.proxy_location),
         extracted_information_schema=task_obj.extracted_information_schema,
         extra_http_headers=task_obj.extra_http_headers,
         workflow_run_id=task_obj.workflow_run_id,
@@ -245,6 +300,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         retry=task_obj.retry,
         max_steps_per_run=task_obj.max_steps_per_run,
         error_code_mapping=task_obj.error_code_mapping,
+        workflow_system_prompt=task_obj.workflow_system_prompt,
         errors=task_obj.errors,
         application=task_obj.application,
         model=task_obj.model,
@@ -265,7 +321,7 @@ def convert_to_task_v2(task_v2_model: TaskV2Model, debug_enabled: bool = False) 
         LOG.debug("Converting TaskV2Model to TaskV2", observer_cruise_id=task_v2_model.observer_cruise_id)
     task_v2_data = {column.name: getattr(task_v2_model, column.name) for column in TaskV2Model.__table__.columns}
     #  Deserialize proxy_location FIRST (string → GeoTarget), otherwise model_validate will fail for city/state proxy selections
-    task_v2_data["proxy_location"] = _deserialize_proxy_location(task_v2_model.proxy_location)
+    task_v2_data["proxy_location"] = deserialize_proxy_location(task_v2_model.proxy_location)
     return TaskV2.model_validate(task_v2_data)
 
 
@@ -310,10 +366,12 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         organization_name=org_model.organization_name,
         webhook_callback_url=org_model.webhook_callback_url,
         max_steps_per_run=org_model.max_steps_per_run,
+        max_steps_per_workflow_run=org_model.max_steps_per_workflow_run,
         max_retries_per_step=org_model.max_retries_per_step,
         domain=org_model.domain,
         bw_organization_id=org_model.bw_organization_id,
         bw_collection_ids=org_model.bw_collection_ids,
+        artifact_url_expiry_seconds=org_model.artifact_url_expiry_seconds,
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )
@@ -372,11 +430,14 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         artifact_type=ArtifactType[artifact_model.artifact_type.upper()],
         uri=artifact_model.uri,
         bundle_key=artifact_model.bundle_key,
+        checksum=artifact_model.checksum,
+        file_size=artifact_model.file_size,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
         workflow_run_id=artifact_model.workflow_run_id,
         workflow_run_block_id=artifact_model.workflow_run_block_id,
         run_id=artifact_model.run_id,
+        browser_session_id=artifact_model.browser_session_id,
         observer_cruise_id=artifact_model.observer_cruise_id,
         observer_thought_id=artifact_model.observer_thought_id,
         created_at=artifact_model.created_at,
@@ -416,8 +477,9 @@ def convert_to_workflow(
         totp_verification_url=workflow_model.totp_verification_url,
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
+        browser_profile_id=workflow_model.browser_profile_id,
         model=workflow_model.model,
-        proxy_location=_deserialize_proxy_location(workflow_model.proxy_location),
+        proxy_location=deserialize_proxy_location(workflow_model.proxy_location),
         max_screenshot_scrolls=workflow_model.max_screenshot_scrolling_times,
         version=workflow_model.version,
         is_saved_task=workflow_model.is_saved_task,
@@ -439,6 +501,8 @@ def convert_to_workflow(
         sequential_key=workflow_model.sequential_key,
         folder_id=workflow_model.folder_id,
         import_error=workflow_model.import_error,
+        created_by=workflow_model.created_by,
+        edited_by=workflow_model.edited_by,
     )
 
 
@@ -462,7 +526,7 @@ def convert_to_workflow_run(
         browser_profile_id=workflow_run_model.browser_profile_id,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
-        proxy_location=_deserialize_proxy_location(workflow_run_model.proxy_location),
+        proxy_location=deserialize_proxy_location(workflow_run_model.proxy_location),
         webhook_callback_url=workflow_run_model.webhook_callback_url,
         webhook_failure_reason=workflow_run_model.webhook_failure_reason,
         totp_verification_url=workflow_run_model.totp_verification_url,
@@ -488,6 +552,10 @@ def convert_to_workflow_run(
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
         failure_category=workflow_run_model.failure_category,
+        ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
+        copilot_session_id=workflow_run_model.copilot_session_id,
+        credits_used=workflow_run_model.credits_used or 0,
+        cached_credits_used=workflow_run_model.cached_credits_used or 0,
     )
 
 
@@ -686,6 +754,9 @@ def convert_to_workflow_run_block(
         executed_branch_expression=workflow_run_block_model.executed_branch_expression,
         executed_branch_result=workflow_run_block_model.executed_branch_result,
         executed_branch_next_block=workflow_run_block_model.executed_branch_next_block,
+        script_run=ScriptRunResponse.model_validate(workflow_run_block_model.script_run)
+        if workflow_run_block_model.script_run
+        else None,
     )
     if task:
         if task.finished_at and task.started_at:
@@ -793,12 +864,55 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
             if value is not None:
                 action_data[key] = value
 
-    # Get the appropriate action class and instantiate it
+    # Get the appropriate action class and instantiate it. Fall back to base Action on
+    # validation/lookup failure so a single malformed row never poisons list endpoints
+    # like the workflow run timeline (SKY-9512).
     action_class = ACTION_TYPE_TO_CLASS.get(action_model.action_type)
     if action_class is None:
-        raise ValueError(f"Unsupported action type: {action_model.action_type}")
+        LOG.warning(
+            "Unknown action_type in DB, hydrating as base Action",
+            action_id=action_model.action_id,
+            action_type=action_model.action_type,
+        )
+        return _hydrate_as_base_action(action_data, action_model)
 
-    return action_class(**action_data)
+    try:
+        return action_class(**action_data)
+    except pydantic.ValidationError as exc:
+        LOG.warning(
+            "Failed to hydrate action as typed subclass, falling back to base Action",
+            action_id=action_model.action_id,
+            action_type=action_model.action_type,
+            errors=exc.errors(),
+        )
+        return _hydrate_as_base_action(action_data, action_model)
+
+
+def _hydrate_as_base_action(action_data: dict[str, typing.Any], action_model: ActionModel) -> Action:
+    """Construct a base Action, dropping fields the base model rejects.
+
+    The action_json may contain subclass-only fields (e.g. MoveAction.x) or values that
+    fail validation against the base Action schema. Strip anything the base model can't
+    accept so we always return *something* renderable for the UI.
+    """
+    try:
+        return Action(**action_data)
+    except pydantic.ValidationError:
+        minimal: dict[str, typing.Any] = {
+            "action_type": action_model.action_type,
+            "status": action_model.status,
+            "action_id": action_model.action_id,
+            "organization_id": action_model.organization_id,
+            "workflow_run_id": action_model.workflow_run_id,
+            "task_id": action_model.task_id,
+            "step_id": action_model.step_id,
+            "created_at": action_model.created_at,
+            "modified_at": action_model.modified_at,
+        }
+        try:
+            return Action(**minimal)
+        except pydantic.ValidationError:
+            return Action.model_construct(**minimal)
 
 
 def convert_to_workflow_schedule(

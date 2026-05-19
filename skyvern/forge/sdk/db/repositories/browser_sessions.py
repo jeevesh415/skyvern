@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from sqlalchemy import asc, case, select
+from sqlalchemy import asc, case, or_, select
 
 from skyvern.exceptions import BrowserProfileNotFound
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -36,12 +36,14 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str,
         name: str,
         description: str | None = None,
+        source_browser_type: str | None = None,
     ) -> BrowserProfile:
         async with self.Session() as session:
             browser_profile = BrowserProfileModel(
                 organization_id=organization_id,
                 name=name,
                 description=description,
+                source_browser_type=source_browser_type,
             )
             session.add(browser_profile)
             await session.commit()
@@ -74,12 +76,27 @@ class BrowserSessionsRepository(BaseRepository):
         self,
         organization_id: str,
         include_deleted: bool = False,
+        page: int = 1,
+        page_size: int = 10,
+        search_key: str | None = None,
     ) -> list[BrowserProfile]:
+        if page < 1:
+            raise ValueError(f"Page must be greater than 0, got {page}")
+        db_page = page - 1
         async with self.Session() as session:
             query = select(BrowserProfileModel).filter_by(organization_id=organization_id)
             if not include_deleted:
                 query = query.filter(BrowserProfileModel.deleted_at.is_(None))
-            browser_profiles = await session.scalars(query.order_by(asc(BrowserProfileModel.created_at)))
+            if search_key:
+                search_like = f"%{search_key}%"
+                query = query.filter(
+                    or_(
+                        BrowserProfileModel.name.ilike(search_like),
+                        BrowserProfileModel.description.ilike(search_like),
+                    )
+                )
+            query = query.order_by(asc(BrowserProfileModel.created_at)).limit(page_size).offset(db_page * page_size)
+            browser_profiles = await session.scalars(query)
             return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
 
     @db_operation("delete_browser_profile")
@@ -100,6 +117,34 @@ class BrowserSessionsRepository(BaseRepository):
                 raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
             browser_profile.deleted_at = datetime.now(timezone.utc)
             await session.commit()
+
+    @db_operation("update_browser_profile")
+    async def update_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> BrowserProfile:
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(browser_profile_id=profile_id)
+                .filter_by(organization_id=organization_id)
+                .filter(BrowserProfileModel.deleted_at.is_(None))
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if not browser_profile:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+
+            if name is not None:
+                browser_profile.name = name
+            if description is not None:
+                browser_profile.description = description
+
+            await session.commit()
+            await session.refresh(browser_profile)
+            return BrowserProfile.model_validate(browser_profile)
 
     @db_operation("get_active_persistent_browser_sessions")
     async def get_active_persistent_browser_sessions(

@@ -4,9 +4,11 @@ from typing import Any, Dict, Match
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
+from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 
 from skyvern.constants import EXTRACT_ACTION_SCROLL_AMOUNT, SCROLL_AMOUNT_MULTIPLIER
+from skyvern.errors.errors import GetTOTPVerificationCodeError, MissingTOTPSourceError
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -14,12 +16,14 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.trace import traced
 from skyvern.services.otp_service import (
     extract_totp_from_navigation_inputs,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
+from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -51,6 +55,29 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
+
+
+def _has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
+    # Mirrors try_generate_totp_from_credential selection: active-with-TOTP, or
+    # exactly one TOTP-bearing candidate when no active is set (multi-no-active -> False).
+    if not workflow_run_id:
+        return False
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if not workflow_run_context:
+        return False
+
+    current_context = skyvern_context.current()
+    active_credential_key = current_context.active_credential_parameter_key if current_context else None
+    if active_credential_key:
+        value = workflow_run_context.values.get(active_credential_key)
+        return isinstance(value, dict) and isinstance(value.get("totp"), str)
+
+    candidate_keys = [
+        key
+        for key, value in workflow_run_context.values.items()
+        if isinstance(value, dict) and isinstance(value.get("totp"), str)
+    ]
+    return len(candidate_keys) == 1
 
 
 def parse_action(
@@ -207,11 +234,13 @@ def parse_action(
         base_action_dict["skyvern_element_hash"] = None
         base_action_dict["skyvern_element_data"] = None
         # Support both "key" (single key from prompt) and "keys" (list, from code/legacy)
-        # Limited to navigation/submission keys to prevent misuse on regular form fields
+        # Navigation/submission keys are always allowed. Single digits and letters are allowed
+        # as a fallback for typing into hidden/overlay input components (e.g., 2FA digit boxes).
         allowed_keys = {"Enter", "Tab", "Escape", "ArrowDown", "ArrowUp"}
         key = action.get("key")
         if key:
-            if key not in allowed_keys:
+            is_single_char = len(key) == 1 and (key.isdigit() or key.isalpha())
+            if key not in allowed_keys and not is_single_char:
                 LOG.warning("KEYPRESS action has unsupported key, skipping action", key=key)
                 return NullAction(**base_action_dict)
             keys = [key]
@@ -242,10 +271,13 @@ def parse_action(
     raise UnsupportedActionType(action_type=action_type)
 
 
+@traced(name="skyvern.agent.parse_actions")
 def parse_actions(
     task: Task, step_id: str, step_order: int, scraped_page: ScrapedPage, json_response: list[Dict[str, Any]]
 ) -> list[Action]:
     actions: list[Action] = []
+    _span = otel_trace.get_current_span()
+    _span.set_attribute("raw_action_count", len(json_response))
     context = skyvern_context.ensure_context()
     totp_code = context.totp_codes.get(task.task_id)
     totp_code_required = bool(totp_code)
@@ -909,6 +941,7 @@ async def generate_cua_fallback_actions(
                 action = TerminateAction(
                     reasoning=reasoning,
                     intention=reasoning,
+                    errors=[GetTOTPVerificationCodeError(reason=reasoning_suffix).to_user_defined_error()],
                 )
             except FailedToGetTOTPVerificationCode as e:
                 reasoning_suffix = f"Failed to get magic link. Reason: {e.reason}"
@@ -916,11 +949,27 @@ async def generate_cua_fallback_actions(
                 action = TerminateAction(
                     reasoning=reasoning,
                     intention=reasoning,
+                    errors=[GetTOTPVerificationCodeError(reason=reasoning_suffix).to_user_defined_error()],
                 )
         else:
+            missing_source_error = MissingTOTPSourceError()
+            LOG.warning(
+                "Magic-link action requested but no TOTP source configured",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                totp_verification_url=strip_query_params(task.totp_verification_url)
+                if task.totp_verification_url
+                else None,
+                totp_identifier=task.totp_identifier,
+                organization_id=task.organization_id,
+            )
+            reasoning = (
+                f"{reasoning}. {missing_source_error.reasoning}" if reasoning else missing_source_error.reasoning
+            )
             action = TerminateAction(
                 reasoning=reasoning,
                 intention=reasoning,
+                errors=[missing_source_error.to_user_defined_error()],
             )
 
     elif skyvern_action_type == "get_verification_code":
@@ -936,7 +985,9 @@ async def generate_cua_fallback_actions(
                 task_id=task.task_id,
                 organization_id=task.organization_id,
                 workflow_run_id=task.workflow_run_id,
-                totp_verification_url=task.totp_verification_url,
+                totp_verification_url=strip_query_params(task.totp_verification_url)
+                if task.totp_verification_url
+                else None,
                 totp_identifier=task.totp_identifier,
             )
             try:
@@ -964,11 +1015,73 @@ async def generate_cua_fallback_actions(
                 intention=reasoning,
             )
         else:
-            # Terminate the task since OTP is necessary but wasn't found/generated
-            action = TerminateAction(
-                reasoning=reasoning,
-                intention=reasoning,
+            # Three-way classification: missing config, configured-but-empty (any of
+            # URL / identifier / credential), or wrong-type otp_value. Each gets a
+            # distinct customer-visible signal so webhook consumers can branch.
+            has_credential = _has_credential_totp_candidate(task.workflow_run_id)
+            no_source_configured = (
+                otp_value is None and not task.totp_verification_url and not task.totp_identifier and not has_credential
             )
+            configured_but_empty = otp_value is None and not no_source_configured
+            if no_source_configured:
+                missing_source_error = MissingTOTPSourceError()
+                LOG.warning(
+                    "Verification-code action requested but no TOTP source configured",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    totp_verification_url=strip_query_params(task.totp_verification_url)
+                    if task.totp_verification_url
+                    else None,
+                    totp_identifier=task.totp_identifier,
+                    organization_id=task.organization_id,
+                )
+                reasoning = (
+                    f"{reasoning}. {missing_source_error.reasoning}" if reasoning else missing_source_error.reasoning
+                )
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    errors=[missing_source_error.to_user_defined_error()],
+                )
+            elif configured_but_empty:
+                # Source configured (URL, identifier, or credential) but no code obtained.
+                # Could be silent poll_otp_value None-return, broken delivery, or
+                # credential generation failure. Attach OTP_ERROR so programmatic
+                # consumers can branch — distinguishes from the wrong-type case below.
+                if task.totp_verification_url:
+                    polled_source = f"totp_verification_url={strip_query_params(task.totp_verification_url)}"
+                elif task.totp_identifier:
+                    polled_source = f"totp_identifier={task.totp_identifier}"
+                else:
+                    polled_source = "credential parameter with TOTP"
+                LOG.warning(
+                    "TOTP source configured but produced no code",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    totp_verification_url=strip_query_params(task.totp_verification_url)
+                    if task.totp_verification_url
+                    else None,
+                    totp_identifier=task.totp_identifier,
+                    has_credential_totp=has_credential,
+                    organization_id=task.organization_id,
+                )
+                reasoning_suffix = (
+                    f"Configured TOTP source ({polled_source}) produced no code — "
+                    "check delivery endpoint or contact Skyvern support if the issue persists."
+                )
+                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    errors=[GetTOTPVerificationCodeError(reason=reasoning_suffix).to_user_defined_error()],
+                )
+            else:
+                # otp_value is non-None but wrong type (e.g. magic link returned for
+                # a TOTP request). Source exists, wrong shape. No new error code.
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
 
     action.organization_id = task.organization_id
     action.workflow_run_id = task.workflow_run_id

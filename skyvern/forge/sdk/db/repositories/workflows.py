@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -29,8 +30,8 @@ from skyvern.forge.sdk.db.models import (
     WorkflowTemplateModel,
 )
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
-from skyvern.forge.sdk.db.utils import convert_to_workflow, serialize_proxy_location
-from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock
+from skyvern.forge.sdk.db.utils import convert_to_workflow, nullable_column_equals, serialize_proxy_location
+from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocationInput
@@ -39,10 +40,23 @@ from skyvern.schemas.workflows import WorkflowStatus
 LOG = structlog.get_logger()
 
 
+@dataclass(frozen=True)
+class WorkflowDispatchState:
+    run_with: str | None
+    cache_key: str | None
+    code_version: int | None
+
+
+@dataclass(frozen=True)
+class WorkflowDispatchUpdateResult:
+    workflow: Workflow
+    previous_dispatch_state: WorkflowDispatchState
+
+
 def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> None:
     """Rebind each block's ``output_parameter`` to the reconciled instance
-    from ``workflow_definition.parameters`` by key, recursing into
-    ``ForLoopBlock.loop_blocks``.
+    from ``workflow_definition.parameters`` by key, recursing into nested
+    loop block children.
 
     The reconcile helper mutates IDs on the top-level parameters list only.
     When a caller round-trips the definition through
@@ -62,7 +76,7 @@ def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> N
             canonical = key_to_output_parameter.get(block.output_parameter.key)
             if canonical is not None and canonical is not block.output_parameter:
                 block.output_parameter = canonical
-            if isinstance(block, ForLoopBlock):
+            if isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 _visit(block.loop_blocks)
 
     _visit(workflow_definition.blocks)
@@ -85,6 +99,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        browser_profile_id: str | None = None,
         model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -99,6 +114,8 @@ class WorkflowsRepository(BaseRepository):
         run_sequentially: bool = False,
         sequential_key: str | None = None,
         folder_id: str | None = None,
+        created_by: str | None = None,
+        edited_by: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -113,6 +130,7 @@ class WorkflowsRepository(BaseRepository):
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
                 persist_browser_session=persist_browser_session,
+                browser_profile_id=browser_profile_id,
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
@@ -125,6 +143,8 @@ class WorkflowsRepository(BaseRepository):
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 folder_id=folder_id,
+                created_by=created_by,
+                edited_by=edited_by,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -582,17 +602,21 @@ class WorkflowsRepository(BaseRepository):
         version: int | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
+        code_version: int | None = None,
         status: str | None = None,
         import_error: str | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
+        created_by: str | None | object = _UNSET,
+        edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -613,6 +637,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.run_with = run_with
                 if cache_key is not None:
                     workflow.cache_key = cache_key
+                if code_version is not None:
+                    workflow.code_version = code_version
                 if status is not None:
                     workflow.status = status
                 if import_error is not None:
@@ -623,6 +649,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.webhook_callback_url = webhook_callback_url
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
+                if browser_profile_id is not _UNSET:
+                    workflow.browser_profile_id = cast(str | None, browser_profile_id)
                 if model is not _UNSET:
                     workflow.model = model
                 if max_screenshot_scrolling_times is not _UNSET:
@@ -635,6 +663,10 @@ class WorkflowsRepository(BaseRepository):
                     workflow.run_sequentially = run_sequentially
                 if sequential_key is not _UNSET:
                     workflow.sequential_key = sequential_key
+                if created_by is not _UNSET:
+                    workflow.created_by = cast(str | None, created_by)
+                if edited_by is not _UNSET:
+                    workflow.edited_by = cast(str | None, edited_by)
                 await session.commit()
                 await session.refresh(workflow)
                 is_template = (
@@ -653,6 +685,207 @@ class WorkflowsRepository(BaseRepository):
             else:
                 raise NotFoundError("Workflow not found")
 
+    @db_operation("update_workflow_dispatch_state_if_latest")
+    async def update_workflow_dispatch_state_if_latest(
+        self,
+        *,
+        workflow_id: str,
+        workflow_permanent_id: str,
+        organization_id: str,
+        expected_version: int,
+        run_with: str,
+        cache_key: str,
+        code_version: int,
+    ) -> Workflow:
+        async with self.Session() as session:
+            newer_version_exists = (
+                select(WorkflowModel.workflow_id)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.version > expected_version)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .exists()
+            )
+            update_workflow_query = (
+                update(WorkflowModel)
+                .where(WorkflowModel.workflow_id == workflow_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.version == expected_version)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(~newer_version_exists)
+                .values(
+                    run_with=run_with,
+                    cache_key=cache_key,
+                    code_version=code_version,
+                )
+                .returning(WorkflowModel.workflow_id)
+            )
+            updated_workflow_id = (await session.execute(update_workflow_query)).scalar_one_or_none()
+            if updated_workflow_id is None:
+                raise NotFoundError("Workflow not found or no longer latest")
+
+            await session.commit()
+            workflow = (
+                await session.scalars(
+                    exclude_deleted(
+                        select(WorkflowModel).filter_by(
+                            workflow_id=workflow_id,
+                            organization_id=organization_id,
+                        ),
+                        WorkflowModel,
+                    )
+                )
+            ).one()
+            is_template = await self.is_workflow_template(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+            return convert_to_workflow(
+                workflow,
+                self.debug_enabled,
+                is_template=is_template,
+            )
+
+    @db_operation("update_workflow_dispatch_state_if_latest_with_previous")
+    async def update_workflow_dispatch_state_if_latest_with_previous(
+        self,
+        *,
+        workflow_id: str,
+        workflow_permanent_id: str,
+        organization_id: str,
+        expected_version: int,
+        run_with: str,
+        cache_key: str,
+        code_version: int,
+    ) -> WorkflowDispatchUpdateResult:
+        async with self.Session() as session:
+            previous_workflow = (
+                await session.scalars(
+                    exclude_deleted(
+                        select(WorkflowModel)
+                        .filter_by(
+                            workflow_id=workflow_id,
+                            organization_id=organization_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                            version=expected_version,
+                        )
+                        .with_for_update(),
+                        WorkflowModel,
+                    )
+                )
+            ).first()
+            if previous_workflow is None:
+                raise NotFoundError("Workflow not found")
+            previous_dispatch_state = WorkflowDispatchState(
+                run_with=previous_workflow.run_with,
+                cache_key=previous_workflow.cache_key,
+                code_version=previous_workflow.code_version,
+            )
+
+            newer_version_exists = (
+                select(WorkflowModel.workflow_id)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.version > expected_version)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .exists()
+            )
+            update_workflow_query = (
+                update(WorkflowModel)
+                .where(WorkflowModel.workflow_id == workflow_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.version == expected_version)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(~newer_version_exists)
+                .values(
+                    run_with=run_with,
+                    cache_key=cache_key,
+                    code_version=code_version,
+                )
+                .returning(WorkflowModel.workflow_id)
+            )
+            updated_workflow_id = (await session.execute(update_workflow_query)).scalar_one_or_none()
+            if updated_workflow_id is None:
+                raise NotFoundError("Workflow not found or no longer latest")
+
+            await session.commit()
+            workflow = (
+                await session.scalars(
+                    exclude_deleted(
+                        select(WorkflowModel).filter_by(
+                            workflow_id=workflow_id,
+                            organization_id=organization_id,
+                        ),
+                        WorkflowModel,
+                    )
+                )
+            ).one()
+            is_template = await self.is_workflow_template(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+            return WorkflowDispatchUpdateResult(
+                workflow=convert_to_workflow(
+                    workflow,
+                    self.debug_enabled,
+                    is_template=is_template,
+                ),
+                previous_dispatch_state=previous_dispatch_state,
+            )
+
+    @db_operation("restore_workflow_script_dispatch_if_matches")
+    async def restore_workflow_script_dispatch_if_matches(
+        self,
+        *,
+        workflow_id: str,
+        organization_id: str,
+        run_with: str | None,
+        cache_key: str | None,
+        code_version: int | None,
+        current_run_with: str | None,
+        current_cache_key: str | None,
+        current_code_version: int | None,
+    ) -> Workflow | None:
+        """Restore script dispatch only if it still matches the deploy write."""
+        async with self.Session() as session:
+            update_workflow_query = (
+                update(WorkflowModel)
+                .where(WorkflowModel.workflow_id == workflow_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(nullable_column_equals(WorkflowModel.run_with, current_run_with))
+                .where(nullable_column_equals(WorkflowModel.cache_key, current_cache_key))
+                .where(nullable_column_equals(WorkflowModel.code_version, current_code_version))
+                .values(
+                    run_with=run_with,
+                    cache_key=cache_key,
+                    code_version=code_version,
+                )
+                .returning(WorkflowModel.workflow_id)
+            )
+            updated_workflow_id = (await session.execute(update_workflow_query)).scalar_one_or_none()
+            if updated_workflow_id is None:
+                await session.commit()
+                return None
+
+            await session.commit()
+            workflow = (
+                await session.scalars(
+                    exclude_deleted(select(WorkflowModel).filter_by(workflow_id=workflow_id), WorkflowModel)
+                )
+            ).one()
+            is_template = await self.is_workflow_template(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+            return convert_to_workflow(
+                workflow,
+                self.debug_enabled,
+                is_template=is_template,
+            )
+
     @db_operation("update_workflow_and_reconcile_definition_params")
     async def update_workflow_and_reconcile_definition_params(
         self,
@@ -669,12 +902,15 @@ class WorkflowsRepository(BaseRepository):
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
+        created_by: str | None | object = _UNSET,
+        edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         """One-session, one-commit update of the workflow row + definition-parameter rows.
 
@@ -741,6 +977,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.webhook_callback_url = webhook_callback_url
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
+            if browser_profile_id is not _UNSET:
+                workflow.browser_profile_id = cast(str | None, browser_profile_id)
             if model is not _UNSET:
                 workflow.model = model
             if max_screenshot_scrolling_times is not _UNSET:
@@ -753,6 +991,10 @@ class WorkflowsRepository(BaseRepository):
                 workflow.run_sequentially = run_sequentially
             if sequential_key is not _UNSET:
                 workflow.sequential_key = sequential_key
+            if created_by is not _UNSET:
+                workflow.created_by = cast(str | None, created_by)
+            if edited_by is not _UNSET:
+                workflow.edited_by = cast(str | None, edited_by)
 
             await session.commit()
             await session.refresh(workflow)

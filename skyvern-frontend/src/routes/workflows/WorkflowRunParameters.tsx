@@ -21,6 +21,7 @@ function WorkflowRunParameters() {
         .get(`/workflows/${workflowPermanentId}`)
         .then((response) => response.data);
     },
+    enabled: !!workflowPermanentId,
     refetchOnWindowFocus: false,
   });
 
@@ -41,6 +42,9 @@ function WorkflowRunParameters() {
   const extraHttpHeaders = location.state
     ? (location.state.extraHttpHeaders as Record<string, string>)
     : null;
+
+  const browserProfileId =
+    (location.state?.browserProfileId as string | null | undefined) ?? null;
 
   const runWith = (location.state?.runWith as string) ?? undefined;
 
@@ -78,6 +82,8 @@ function WorkflowRunParameters() {
           maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
         extraHttpHeaders:
           extraHttpHeaders ?? workflow.extra_http_headers ?? null,
+        browserProfileId:
+          browserProfileId ?? workflow.browser_profile_id ?? null,
         cdpAddress: null,
         runWith,
       }}

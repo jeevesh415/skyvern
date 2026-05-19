@@ -148,6 +148,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         proxy_location: saveData.settings.proxyLocation,
         webhook_callback_url: saveData.settings.webhookCallbackUrl,
         persist_browser_session: saveData.settings.persistBrowserSession,
+        browser_profile_id: saveData.settings.browserProfileId,
         model: saveData.settings.model,
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
@@ -164,6 +165,8 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           parameters: saveData.parameters,
           blocks: saveData.blocks,
           finally_block_label: saveData.settings.finallyBlockLabel ?? undefined,
+          workflow_system_prompt:
+            saveData.settings.workflowSystemPrompt ?? undefined,
         },
         is_saved_task: saveData.workflow.is_saved_task,
         status: opts?.status ?? saveData.workflow.status,

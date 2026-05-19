@@ -10,6 +10,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.sdk_actions import (
@@ -34,6 +35,7 @@ LOG = structlog.get_logger()
     description="Execute a single SDK action with the specified parameters",
     tags=["SDK"],
     openapi_extra={
+        "x-excluded": True,
         "x-fern-sdk-method-name": "run_sdk_action",
     },
 )
@@ -89,6 +91,7 @@ async def run_sdk_action(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization=organization,
             version=None,
+            trigger_type=WorkflowRunTriggerType.api,
         )
         workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=workflow_run.workflow_run_id,

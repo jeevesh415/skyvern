@@ -7,6 +7,7 @@ from io import BytesIO
 from typing import Any
 
 import structlog
+from opentelemetry import trace as otel_trace
 from PIL import Image
 from playwright._impl._errors import Error as PlaywrightError
 from playwright._impl._errors import TimeoutError
@@ -15,7 +16,7 @@ from playwright.async_api import ElementHandle, Frame, Page
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.trace import apply_context_attrs, traced
 
 LOG = structlog.get_logger()
 
@@ -35,6 +36,33 @@ def load_js_script() -> str:
 
 JS_FUNCTION_DEFS = load_js_script()
 
+_NAVIGATION_RECOVERY_MAX_ATTEMPTS = 4
+_NAVIGATION_SETTLE_TIMEOUT_MS = 3000
+
+
+def _is_navigation_context_lost(error_msg: str) -> bool:
+    if "Execution context was destroyed" in error_msg:
+        return True
+    return "ReferenceError" in error_msg and "is not defined" in error_msg
+
+
+async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) -> None:
+    if timeout_ms <= 0:
+        return
+    try:
+        await frame.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except PlaywrightError:
+        return
+
+
+def _load_cursor_overlay_js() -> str:
+    path = f"{SKYVERN_DIR}/webeye/scraper/cursorOverlay.js"
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+_CURSOR_OVERLAY_JS = _load_cursor_overlay_js()
+
 
 class ScreenshotMode(StrEnum):
     LITE = "lite"
@@ -47,6 +75,11 @@ async def _page_screenshot_helper(
     full_page: bool = False,
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
 ) -> bytes:
+    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+        try:
+            await SkyvernFrame.hide_cursor_overlay(page)
+        except Exception:
+            pass
     try:
         return await page.screenshot(
             path=file_path,
@@ -64,6 +97,12 @@ async def _page_screenshot_helper(
             full_page=full_page,
             animations="allow",
         )
+    finally:
+        if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+            try:
+                await SkyvernFrame.show_cursor_overlay(page)
+            except Exception:
+                pass
 
 
 async def _current_viewpoint_screenshot_helper(
@@ -156,7 +195,7 @@ async def _scrolling_screenshots_helper(
             # check if the scroll height changed, if so, rebuild the element tree
             _, scroll_height = await skyvern_page.get_scroll_width_and_height()
             if scroll_height != initial_scroll_height:
-                LOG.warning(
+                LOG.debug(
                     "Scroll height changed, rebuild the element tree",
                     scroll_height=scroll_height,
                     initial_scroll_height=initial_scroll_height,
@@ -251,38 +290,144 @@ class SkyvernFrame:
                 return await frame.evaluate(expression=expression, arg=arg)
         except PlaywrightError as e:
             error_msg = str(e)
-            is_context_destroyed = "Execution context was destroyed" in error_msg
-            is_domutils_missing = "ReferenceError" in error_msg and "is not defined" in error_msg
-            if is_context_destroyed or is_domutils_missing:
-                LOG.warning(
-                    "JS execution context lost (likely due to page navigation), re-injecting domUtils.js and retrying",
-                    expression=expression[:200],
-                    error=error_msg[:200],
-                )
-                try:
-                    await frame.evaluate(expression=JS_FUNCTION_DEFS)
-                except PlaywrightError:
-                    LOG.warning("Re-injection of domUtils.js also failed, page may still be navigating")
-                    raise
-                # First call failed fast (context destroyed, not timeout), so a fresh
-                # timeout for the retry is acceptable.
-                try:
-                    async with asyncio.timeout(timeout_ms / 1000):
-                        return await frame.evaluate(expression=expression, arg=arg)
-                except asyncio.TimeoutError:
-                    LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
-                    raise TimeoutError("Skyvern timed out trying to analyze the page")
-            raise
+            if not _is_navigation_context_lost(error_msg):
+                raise
+            return await SkyvernFrame._evaluate_with_navigation_recovery(
+                frame=frame,
+                expression=expression,
+                arg=arg,
+                timeout_ms=timeout_ms,
+                initial_error=error_msg,
+            )
         except asyncio.TimeoutError:
             LOG.exception("Skyvern timed out trying to analyze the page", expression=expression)
             raise TimeoutError("Skyvern timed out trying to analyze the page")
 
     @staticmethod
+    async def _evaluate_with_navigation_recovery(
+        frame: Page | Frame,
+        expression: str,
+        arg: Any | None,
+        timeout_ms: float,
+        initial_error: str,
+    ) -> Any:
+        # Multi-hop SSO/OIDC flows (especially response_mode=form_post) can destroy
+        # the JS execution context several times in a row as the page auto-submits
+        # through redirects. Wait for the page to settle between attempts instead
+        # of racing the next navigation. The whole recovery shares one monotonic
+        # deadline so retries can't compound into many multiples of timeout_ms.
+        per_attempt_seconds = timeout_ms / 1000
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + per_attempt_seconds * _NAVIGATION_RECOVERY_MAX_ATTEMPTS
+
+        def _remaining_seconds() -> float:
+            return max(0.0, deadline - loop.time())
+
+        last_error_msg = initial_error
+        for attempt in range(1, _NAVIGATION_RECOVERY_MAX_ATTEMPTS + 1):
+            if _remaining_seconds() <= 0:
+                LOG.error(
+                    "Skyvern timed out trying to analyze the page after navigation recovery",
+                    expression=expression,
+                )
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+
+            LOG.warning(
+                "JS execution context lost (likely due to page navigation), re-injecting domUtils.js and retrying",
+                attempt=attempt,
+                expression=expression[:200],
+                error=last_error_msg[:200],
+            )
+            settle_ms = min(_NAVIGATION_SETTLE_TIMEOUT_MS, _remaining_seconds() * 1000)
+            await _wait_for_navigation_settle(frame, timeout_ms=settle_ms)
+
+            inject_budget = min(per_attempt_seconds, _remaining_seconds())
+            if inject_budget <= 0:
+                LOG.error(
+                    "Skyvern timed out trying to analyze the page after navigation recovery",
+                    expression=expression,
+                )
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+            try:
+                async with asyncio.timeout(inject_budget):
+                    await frame.evaluate(expression=JS_FUNCTION_DEFS)
+            except asyncio.TimeoutError:
+                LOG.exception(
+                    "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
+                    expression=expression,
+                )
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+            except PlaywrightError as inject_err:
+                last_error_msg = str(inject_err)
+                if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
+                    LOG.warning(
+                        "Re-injection of domUtils.js also failed, page may still be navigating",
+                        attempts=attempt,
+                    )
+                    raise
+                continue
+
+            retry_budget = min(per_attempt_seconds, _remaining_seconds())
+            if retry_budget <= 0:
+                LOG.error(
+                    "Skyvern timed out trying to analyze the page after navigation recovery",
+                    expression=expression,
+                )
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+            try:
+                async with asyncio.timeout(retry_budget):
+                    return await frame.evaluate(expression=expression, arg=arg)
+            except asyncio.TimeoutError:
+                LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
+                raise TimeoutError("Skyvern timed out trying to analyze the page")
+            except PlaywrightError as retry_err:
+                last_error_msg = str(retry_err)
+                if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
+                    raise
+
+        # The loop either returns or raises; this is unreachable but keeps mypy happy.
+        raise PlaywrightError(last_error_msg)
+
+    @staticmethod
     async def get_url(frame: Page | Frame) -> str:
         return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
 
+    # -- cursor overlay helpers ------------------------------------------------
+
     @staticmethod
-    @traced()
+    async def ensure_cursor_overlay_loaded(page: Page) -> None:
+        """Inject ``cursorOverlay.js`` into *page* if not already present."""
+        is_loaded = await SkyvernFrame.evaluate(page, "() => !!window.__pwCursorInit")
+        if not is_loaded:
+            await SkyvernFrame.evaluate(page, _CURSOR_OVERLAY_JS)
+
+    @staticmethod
+    async def cursor_init(page: Page) -> None:
+        """Create the cursor dot and inject CSS keyframes."""
+        await SkyvernFrame.evaluate(page, "() => __pwCursorInit()")
+
+    @staticmethod
+    async def cursor_move(page: Page, x: float, y: float) -> None:
+        """Move cursor to *(x, y)* and leave interpolated trail dots."""
+        await SkyvernFrame.evaluate(page, "(pos) => __pwCursorMove(pos)", [x, y])
+
+    @staticmethod
+    async def cursor_click_ring(page: Page, x: float, y: float) -> None:
+        """Spawn an expanding ring animation at *(x, y)*."""
+        await SkyvernFrame.evaluate(page, "(pos) => __pwCursorClickRing(pos)", [x, y])
+
+    @staticmethod
+    async def hide_cursor_overlay(page: Page) -> None:
+        """Hide all ``[data-pw-overlay]`` elements (for screenshots)."""
+        await SkyvernFrame.evaluate(page, "() => { if (window.__pwCursorHide) __pwCursorHide(); }")
+
+    @staticmethod
+    async def show_cursor_overlay(page: Page) -> None:
+        """Re-show all ``[data-pw-overlay]`` elements after screenshots."""
+        await SkyvernFrame.evaluate(page, "() => { if (window.__pwCursorShow) __pwCursorShow(); }")
+
+    @staticmethod
+    @traced(name="skyvern.browser.scrolling_screenshot")
     async def take_scrolling_screenshot(
         page: Page,
         file_path: str | None = None,
@@ -356,7 +501,7 @@ class SkyvernFrame:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod
-    @traced()
+    @traced(name="skyvern.browser.split_screenshots")
     async def take_split_screenshots(
         page: Page,
         url: str | None = None,
@@ -392,6 +537,7 @@ class SkyvernFrame:
     def get_frame(self) -> Page | Frame:
         return self.frame
 
+    @traced(name="skyvern.browser.get_content")
     async def get_content(self, timeout: float = PAGE_CONTENT_TIMEOUT) -> str:
         async with asyncio.timeout(timeout):
             return await self.frame.content()
@@ -551,7 +697,7 @@ class SkyvernFrame:
         js_script = "() => removeAllUniqueIds()"
         await self.evaluate(frame=self.frame, expression=js_script)
 
-    @traced()
+    @traced(name="skyvern.browser.element_tree_from_body")
     async def build_tree_from_body(
         self,
         frame_name: str | None,
@@ -568,7 +714,7 @@ class SkyvernFrame:
             arg=[frame_name, frame_index, must_included_tags],
         )
 
-    @traced()
+    @traced(name="skyvern.browser.incremental_element_tree")
     async def get_incremental_element_tree(
         self,
         wait_until_finished: bool = True,
@@ -579,7 +725,7 @@ class SkyvernFrame:
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
         )
 
-    @traced()
+    @traced(name="skyvern.browser.element_tree_from_element")
     async def build_tree_from_element(
         self,
         starter: ElementHandle,
@@ -592,12 +738,22 @@ class SkyvernFrame:
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
         )
 
+    @traced(name="skyvern.browser.wait_for_animation")
     async def safe_wait_for_animation_end(self, before_wait_sec: float = 0, timeout_ms: float = 3000) -> None:
+        # Separates the fast finished-quickly path from the timeout/error paths
+        # that burn the full timeout budget — explains the 124x p95/p50 ratio.
+        _span = otel_trace.get_current_span()
         try:
             await asyncio.sleep(before_wait_sec)
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
             await self.wait_for_animation_end(timeout_ms=timeout_ms)
+            _span.set_attribute("animation_result", "finished")
+        except (TimeoutError, asyncio.TimeoutError):
+            _span.set_attribute("animation_result", "timeout")
+            LOG.debug("Timed out waiting for animation end, but ignore it", exc_info=True)
+            return
         except Exception:
+            _span.set_attribute("animation_result", "error")
             LOG.debug("Failed to wait for animation end, but ignore it", exc_info=True)
             return
 
@@ -613,6 +769,7 @@ class SkyvernFrame:
                     return
                 await asyncio.sleep(0.1)
 
+    @traced(name="skyvern.browser.page_ready", role="wrapper")
     async def wait_for_page_ready(
         self,
         network_idle_timeout_ms: float = 3000,
@@ -632,84 +789,53 @@ class SkyvernFrame:
         This is designed for cached action execution to ensure the page is ready
         before attempting to interact with elements.
         """
-        total_start_time = time.time()
+        _tracer = otel_trace.get_tracer("skyvern")
 
         # 1. Wait for loading indicators to disappear (longest timeout first)
-        loading_indicator_duration_ms = 0.0
-        step_start_time = time.time()
         loading_indicator_result = "success"
-        try:
-            await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
-        except (TimeoutError, asyncio.TimeoutError):
-            loading_indicator_result = "timeout"
-            LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
-        except Exception:
-            loading_indicator_result = "error"
-            LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
-        finally:
-            loading_indicator_duration_ms = (time.time() - step_start_time) * 1000
-            LOG.info(
-                "page_readiness_check",
-                step="loading_indicators",
-                result=loading_indicator_result,
-                duration_ms=loading_indicator_duration_ms,
-                timeout_ms=loading_indicator_timeout_ms,
-            )
+        with _tracer.start_as_current_span("skyvern.browser.page_ready.loading_indicators") as _li_span:
+            apply_context_attrs(_li_span)
+            _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
+            try:
+                await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
+            except (TimeoutError, asyncio.TimeoutError):
+                loading_indicator_result = "timeout"
+                LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
+            except Exception:
+                loading_indicator_result = "error"
+                LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
+            finally:
+                _li_span.set_attribute("result", loading_indicator_result)
 
         # 2. Wait for network idle (with short timeout - some pages never go idle)
-        network_idle_duration_ms = 0.0
-        step_start_time = time.time()
         network_idle_result = "success"
-        try:
-            await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
-        except (TimeoutError, asyncio.TimeoutError):
-            network_idle_result = "timeout"
-            LOG.warning("Network idle timeout - page may have constant activity, proceeding")
-        finally:
-            network_idle_duration_ms = (time.time() - step_start_time) * 1000
-            LOG.info(
-                "page_readiness_check",
-                step="network_idle",
-                result=network_idle_result,
-                duration_ms=network_idle_duration_ms,
-                timeout_ms=network_idle_timeout_ms,
-            )
+        with _tracer.start_as_current_span("skyvern.browser.page_ready.network_idle") as _ni_span:
+            apply_context_attrs(_ni_span)
+            _ni_span.set_attribute("timeout_ms", network_idle_timeout_ms)
+            try:
+                await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
+            except (TimeoutError, asyncio.TimeoutError):
+                network_idle_result = "timeout"
+                LOG.warning("Network idle timeout - page may have constant activity, proceeding")
+            finally:
+                _ni_span.set_attribute("result", network_idle_result)
 
         # 3. Wait for DOM to stabilize
-        dom_stability_duration_ms = 0.0
-        step_start_time = time.time()
         dom_stability_result = "success"
-        try:
-            await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
-        except (TimeoutError, asyncio.TimeoutError):
-            dom_stability_result = "timeout"
-            LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
-        except Exception:
-            dom_stability_result = "error"
-            LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
-        finally:
-            dom_stability_duration_ms = (time.time() - step_start_time) * 1000
-            LOG.info(
-                "page_readiness_check",
-                step="dom_stability",
-                result=dom_stability_result,
-                duration_ms=dom_stability_duration_ms,
-                timeout_ms=dom_stability_timeout_ms,
-                stable_ms=dom_stable_ms,
-            )
-
-        # Log total page readiness check duration
-        total_duration_ms = (time.time() - total_start_time) * 1000
-        LOG.info(
-            "page_readiness_check_complete",
-            total_duration_ms=total_duration_ms,
-            loading_indicator_duration_ms=loading_indicator_duration_ms,
-            network_idle_duration_ms=network_idle_duration_ms,
-            dom_stability_duration_ms=dom_stability_duration_ms,
-            loading_indicator_result=loading_indicator_result,
-            network_idle_result=network_idle_result,
-            dom_stability_result=dom_stability_result,
-        )
+        with _tracer.start_as_current_span("skyvern.browser.page_ready.dom_stability") as _ds_span:
+            apply_context_attrs(_ds_span)
+            _ds_span.set_attribute("timeout_ms", dom_stability_timeout_ms)
+            _ds_span.set_attribute("stable_ms", dom_stable_ms)
+            try:
+                await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
+            except (TimeoutError, asyncio.TimeoutError):
+                dom_stability_result = "timeout"
+                LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
+            except Exception:
+                dom_stability_result = "error"
+                LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
+            finally:
+                _ds_span.set_attribute("result", dom_stability_result)
 
     async def _wait_for_loading_indicators_gone(self, timeout_ms: float = 5000) -> None:
         """

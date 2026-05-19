@@ -30,7 +30,10 @@ import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunO
 import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
 import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode";
 import { DebugStoreProvider } from "@/store/DebugStoreContext";
+import { BrowserProfileDetailPage } from "@/routes/browserProfiles/BrowserProfileDetailPage.tsx";
+import { BrowserProfilesPage } from "@/routes/browserProfiles/BrowserProfilesPage.tsx";
 import { CredentialsPage } from "@/routes/credentials/CredentialsPage.tsx";
+import { IntegrationsUnavailable } from "@/routes/integrations/IntegrationsUnavailable";
 import { RunRouter } from "@/routes/runs/RunRouter";
 import { SchedulesRoute } from "@/routes/schedules/SchedulesRoute";
 import { ScheduleDetailRoute } from "@/routes/schedules/ScheduleDetailRoute";
@@ -44,6 +47,7 @@ const router = createBrowserRouter([
       { path: "stream", element: <></> },
       { path: "recordings", element: <></> },
       { path: "downloads", element: <></> },
+      { path: "runs", element: <></> },
     ],
   },
   {
@@ -276,6 +280,30 @@ const router = createBrowserRouter([
           {
             index: true,
             element: <CredentialsPage />,
+          },
+        ],
+      },
+      {
+        path: "browser-profiles",
+        element: <PageLayout />,
+        children: [
+          {
+            index: true,
+            element: <BrowserProfilesPage />,
+          },
+          {
+            path: ":profileId",
+            element: <BrowserProfileDetailPage />,
+          },
+        ],
+      },
+      {
+        path: "integrations",
+        element: <PageLayout />,
+        children: [
+          {
+            index: true,
+            element: <IntegrationsUnavailable />,
           },
         ],
       },

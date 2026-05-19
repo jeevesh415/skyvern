@@ -7,6 +7,8 @@ import {
   useNodes,
   useReactFlow,
 } from "@xyflow/react";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { useParams } from "react-router-dom";
 import type { StartNode } from "./types";
 import { AppNode } from "..";
 import {
@@ -15,6 +17,16 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -29,6 +41,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
+import { BrowserProfileSelector } from "@/routes/workflows/components/BrowserProfileSelector";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { ModelSelector } from "@/components/ModelSelector";
@@ -41,6 +54,7 @@ import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { placeholders } from "@/routes/workflows/editor/helpContent";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
+import { useResetProfileMutation } from "@/routes/workflows/hooks/useResetProfileMutation";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
@@ -52,15 +66,18 @@ import { cn } from "@/util/utils";
 import { Button } from "@/components/ui/button";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import { getWorkflowBlocks } from "../../workflowEditorUtils";
+import { isLoopNode } from "../LoopNode/types";
 
 interface StartSettings {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
+  browserProfileId: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrollingTimes: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
   finallyBlockLabel: string | null;
+  workflowSystemPrompt: string | null;
 }
 
 function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
@@ -69,12 +86,19 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const [facing, setFacing] = useState<"front" | "back">("front");
+  const [isResetProfileDialogOpen, setIsResetProfileDialogOpen] =
+    useState(false);
+  const { workflowPermanentId } = useParams();
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const isRecording = recordingStore.isRecording;
+  const resetProfileMutation = useResetProfileMutation({
+    workflowPermanentId,
+    onSuccess: () => setIsResetProfileDialogOpen(false),
+  });
 
   // Local state for webhook URL to fix race condition where data.webhookCallbackUrl
   // isn't updated yet when user clicks "Test Webhook" after typing
@@ -103,7 +127,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
 
   const parentNode = parentId ? reactFlowInstance.getNode(parentId) : null;
   const isInsideConditional = parentNode?.type === "conditional";
-  const isInsideLoop = parentNode?.type === "loop";
+  const loopParent = parentNode && isLoopNode(parentNode) ? parentNode : null;
   const withWorkflowSettings = data.withWorkflowSettings;
   const finallyBlockLabel = withWorkflowSettings
     ? data.finallyBlockLabel
@@ -130,6 +154,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
       persistBrowserSession: data.withWorkflowSettings
         ? data.persistBrowserSession
         : false,
+      browserProfileId: data.withWorkflowSettings
+        ? data.browserProfileId
+        : null,
       model: data.withWorkflowSettings ? data.model : null,
       maxScreenshotScrollingTimes: data.withWorkflowSettings
         ? data.maxScreenshotScrolls
@@ -139,6 +166,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
         : null,
       finallyBlockLabel: data.withWorkflowSettings
         ? data.finallyBlockLabel
+        : null,
+      workflowSystemPrompt: data.withWorkflowSettings
+        ? (data.workflowSystemPrompt ?? null)
         : null,
     };
   };
@@ -394,6 +424,65 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                             }}
                           />
                         </div>
+                        {data.persistBrowserSession && workflowPermanentId && (
+                          <Dialog
+                            open={isResetProfileDialogOpen}
+                            onOpenChange={setIsResetProfileDialogOpen}
+                          >
+                            <DialogTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                size="sm"
+                                className="nopan"
+                              >
+                                <ReloadIcon className="mr-2 h-3 w-3" />
+                                Reset Profile
+                              </Button>
+                            </DialogTrigger>
+                            <DialogContent>
+                              <DialogHeader>
+                                <DialogTitle>Reset saved profile?</DialogTitle>
+                                <DialogDescription>
+                                  Clears the saved browser profile for this
+                                  workflow. The next run will start from a fresh
+                                  browser state. Use this if the saved profile
+                                  is stuck or producing errors.
+                                </DialogDescription>
+                              </DialogHeader>
+                              <DialogFooter>
+                                <DialogClose asChild>
+                                  <Button variant="secondary">Cancel</Button>
+                                </DialogClose>
+                                <Button
+                                  variant="destructive"
+                                  onClick={() => {
+                                    resetProfileMutation.mutate();
+                                  }}
+                                  disabled={resetProfileMutation.isPending}
+                                >
+                                  {resetProfileMutation.isPending && (
+                                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                                  )}
+                                  Reset Profile
+                                </Button>
+                              </DialogFooter>
+                            </DialogContent>
+                          </Dialog>
+                        )}
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Label>Default Browser Profile</Label>
+                          <HelpTooltip content="The default browser profile used when running this workflow. Can be overridden per run." />
+                        </div>
+                        <BrowserProfileSelector
+                          value={data.browserProfileId}
+                          onChange={(value) => {
+                            update({ browserProfileId: value });
+                          }}
+                          compact
+                        />
                       </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
@@ -473,6 +562,23 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                           </SelectContent>
                         </Select>
                       </div>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Label>Workflow System Prompt</Label>
+                          <HelpTooltip content="Applied to every LLM call in this workflow, including any sub-agents." />
+                        </div>
+                        <WorkflowBlockInputTextarea
+                          nodeId={id}
+                          onChange={(value) => {
+                            update({
+                              workflowSystemPrompt: value.length ? value : null,
+                            });
+                          }}
+                          value={data.workflowSystemPrompt ?? ""}
+                          placeholder="e.g. Format all dates as YYYY-MM-DD and all currency values as USD with two decimals."
+                          className="nopan text-xs"
+                        />
+                      </div>
                     </div>
                   </AccordionContent>
                 </AccordionItem>
@@ -508,18 +614,26 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
       />
       <div className="w-[30rem] rounded-lg bg-slate-elevation4 px-6 py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
         Start
-        {isInsideLoop && (
+        {loopParent ? (
           <div className="mt-4 flex gap-3 rounded-md bg-slate-800 p-3 normal-case tracking-normal">
             <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
             <div className="space-y-1 text-left font-normal text-slate-400">
-              Use{" "}
-              <code className="text-white">
-                &#123;&#123;&nbsp;current_value&nbsp;&#125;&#125;
-              </code>{" "}
-              to get the current loop value for a given iteration.
+              {loopParent.data.loopKind === "while" ? (
+                <>
+                  Use{" "}
+                  <code className="text-white">{`{{ current_index }}`}</code> to
+                  get the current zero-based loop index for a given iteration.
+                </>
+              ) : (
+                <>
+                  Use{" "}
+                  <code className="text-white">{`{{ current_value }}`}</code> to
+                  get the current loop value for a given iteration.
+                </>
+              )}
             </div>
           </div>
-        )}
+        ) : null}
         {isInsideConditional && (
           <div className="mt-4 rounded-md border border-dashed border-slate-500 p-4 text-center font-normal normal-case tracking-normal text-slate-300">
             Start adding blocks to be executed for the selected condition
